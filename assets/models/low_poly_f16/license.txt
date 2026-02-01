@@ -1,0 +1,11 @@
+Model Information:
+* title:	Low-Poly F-16
+* source:	https://sketchfab.com/3d-models/low-poly-f-16-9e09afcd601a45bf9fcd795b22f0fb7b
+* author:	tzakh13 (https://sketchfab.com/tzakh13)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Low-Poly F-16" (https://sketchfab.com/3d-models/low-poly-f-16-9e09afcd601a45bf9fcd795b22f0fb7b) by tzakh13 (https://sketchfab.com/tzakh13) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

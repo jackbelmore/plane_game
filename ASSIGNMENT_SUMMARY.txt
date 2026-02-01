@@ -1,0 +1,118 @@
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                  PARALLEL WORK - TASK ASSIGNMENT                             ║
+║                         FOR GEMINI FLASH & CLAUDE                            ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+
+📋 SITUATION:
+  ✅ Camera fix complete (just now)
+  ❌ Flight physics still broken (plane falling, turning doesn't work)
+  ⏳ Need to fix 2 critical issues in parallel
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🎯 TASK DISTRIBUTION:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ CLAUDE CODE SESSION                                                          │
+│ ────────────────────────────────────────────────────────────────────────────│
+│                                                                              │
+│ FOCUS: Flight Physics Fixes (Gameplay Critical)                             │
+│ TIME: 45 minutes                                                             │
+│ PRIORITY: CRITICAL                                                           │
+│                                                                              │
+│ TASKS:                                                                       │
+│   1. Fix Thrust - Increase MAX_THRUST_NEWTONS (50k → 100k)                 │
+│   2. Fix Turning - Verify local-space rotation axes                         │
+│                                                                              │
+│ SUCCESS = Plane stays in air + turns work                                   │
+│                                                                              │
+│ See: PARALLEL_ASSIGNMENT.md - Section 1                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ GEMINI FLASH                                                                 │
+│ ────────────────────────────────────────────────────────────────────────────│
+│                                                                              │
+│ FOCUS: Diagnostics & Physics Documentation                                  │
+│ TIME: 30 minutes                                                             │
+│ PRIORITY: HIGH (Helps verify Claude's fixes)                                │
+│                                                                              │
+│ TASKS:                                                                       │
+│   1. Create debug_flight_diagnostics() system                               │
+│      → Prints altitude, speed, rotation, inputs, yaw rate                   │
+│      → Every 0.5 seconds in clear format                                    │
+│                                                                              │
+│   2. Create PHYSICS_CONSTANTS_GUIDE.md                                      │
+│      → Document each constant (thrust, rates, boost, drag)                  │
+│      → Physics formulas explaining effects                                  │
+│      → Tuning guide for different feels                                     │
+│                                                                              │
+│ SUCCESS = Diagnostic output shows physics state clearly                     │
+│           Constants documented with formulas                                │
+│                                                                              │
+│ See: PARALLEL_ASSIGNMENT.md - Section 2                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+
+⚡ EXECUTION PLAN:
+
+STEP 1: Start both in parallel
+  ├─ Claude Code: Read PARALLEL_ASSIGNMENT.md section 1
+  └─ Gemini Flash: Read PARALLEL_ASSIGNMENT.md section 2
+
+STEP 2: Work independently (45 min / 30 min)
+  ├─ Claude: Fix thrust + turning in src/main.rs
+  └─ Gemini: Add diagnostics + create guide
+
+STEP 3: Merge & Test
+  ├─ Integrate Claude's physics fixes
+  ├─ Add Gemini's diagnostics
+  ├─ cargo build --release
+  └─ Run & verify: plane flies, turns work, diagnostics show correct state
+
+STEP 4: If issues detected
+  ├─ Use Gemini's diagnostic output to identify problems
+  └─ Claude fixes based on diagnostic feedback
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📊 CURRENT STATUS:
+
+│ Task              │ Status   │ Owner        │ Time  │ Critical? │
+├──────────────────┼──────────┼──────────────┼───────┼───────────┤
+│ Camera Fix       │ ✅ DONE │ (Me)         │ 10m   │ No        │
+│ Thrust Fix       │ ⏳ TODO │ Claude Code  │ 20m   │ YES       │
+│ Turning Fix      │ ⏳ TODO │ Claude Code  │ 25m   │ YES       │
+│ Diagnostics      │ ⏳ TODO │ Gemini Flash │ 20m   │ Medium    │
+│ Constants Doc    │ ⏳ TODO │ Gemini Flash │ 10m   │ Medium    │
+│ Space Scenery    │ ⏳ TODO │ (Later)      │ 30m   │ No        │
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🎮 EXPECTED OUTCOME:
+
+After 45 minutes (when both complete):
+  ✅ Plane maintains altitude at throttle 50%+
+  ✅ Roll left + pitch up = turns left
+  ✅ Roll right + pitch up = turns right
+  ✅ Diagnostics show correct yaw rate when turning
+  ✅ Physics constants documented and tunable
+  ✅ Game fully playable for basic flight
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📝 FILES TO SHARE:
+
+With Claude Code:
+  → PARALLEL_ASSIGNMENT.md (full details)
+  → FLIGHT_PHYSICS_FIX_PLAN.md (reference)
+  → Link to src/main.rs lines 823-909
+
+With Gemini Flash:
+  → PARALLEL_ASSIGNMENT.md (full details)
+  → Link to src/main.rs lines 823-909
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Ready to send both AI models their assignments!

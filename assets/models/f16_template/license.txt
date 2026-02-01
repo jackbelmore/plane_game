@@ -1,0 +1,11 @@
+Model Information:
+* title:	F-16 template.GLB
+* source:	https://sketchfab.com/3d-models/f-16-templateglb-0961e0ad8a1a465e9cc232de88f5d075
+* author:	Nilstheacevrchat (https://sketchfab.com/Nilstheacevrchat)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "F-16 template.GLB" (https://sketchfab.com/3d-models/f-16-templateglb-0961e0ad8a1a465e9cc232de88f5d075) by Nilstheacevrchat (https://sketchfab.com/Nilstheacevrchat) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

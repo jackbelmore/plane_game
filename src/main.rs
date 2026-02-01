@@ -1,0 +1,1548 @@
+use bevy::prelude::*;
+use avian3d::prelude::*;
+
+// ============================================================================
+// COMPONENTS - Data containers for game entities
+// ============================================================================
+
+/// Marker component to identify the player plane parent
+#[derive(Component)]
+struct PlayerPlane;
+
+/// Marker for the container that holds the visual model
+/// Allowing us to rotate the model (e.g. for banking) without affecting physics
+#[derive(Component)]
+struct ModelContainer;
+
+/// Stores current player input state
+#[derive(Component)]
+struct PlayerInput {
+    pitch: f32,
+    roll: f32,
+    yaw: f32,      // Added Yaw (Rudder)
+    throttle: f32,
+    _brake: f32,    // Airbrake
+}
+
+/// Afterburner flame effect component
+#[derive(Component)]
+struct AfterburnerFlame;
+
+/// Timer for debug diagnostics
+#[derive(Component)]
+struct DiagnosticTimer(Timer);
+
+impl Default for PlayerInput {
+    fn default() -> Self {
+        Self {
+            pitch: 0.0,
+            roll: 0.0,
+            yaw: 0.0,
+            throttle: 0.0, // Start at 0 throttle
+            _brake: 0.0,
+        }
+    }
+}
+
+/// Fly-By-Wire Flight Control Computer
+/// Stabilizes the inherently unstable F-16 airframe using PID controllers
+#[derive(Component)]
+struct FlightControlComputer {
+    // Target attitude (what player wants)
+    _target_pitch: f32,  // Radians
+    _target_roll: f32,   // Radians
+    _target_yaw_rate: f32, // Reserved for future yaw control
+
+    // PID state for pitch
+    _pitch_error_integral: f32,
+    _pitch_error_prev: f32,
+
+    // PID state for roll
+    _roll_error_integral: f32,
+    _roll_error_prev: f32,
+
+    // PID gains (tuned for F-16)
+    _pitch_kp: f32,  // Proportional gain
+    _pitch_ki: f32,  // Integral gain
+    _pitch_kd: f32,  // Derivative gain
+
+    _roll_kp: f32,
+    _roll_ki: f32,
+    _roll_kd: f32,
+
+    // Control modes
+    enabled: bool,      // Enable/disable FBW
+    sas_enabled: bool,  // Stability Augmentation System (always recommended)
+}
+
+impl Default for FlightControlComputer {
+    fn default() -> Self {
+        Self {
+            _target_pitch: 0.0,
+            _target_roll: 0.0,
+            _target_yaw_rate: 0.0,
+
+            _pitch_error_integral: 0.0,
+            _pitch_error_prev: 0.0,
+
+            _roll_error_integral: 0.0,
+            _roll_error_prev: 0.0,
+
+            // VERY gentle PID gains (reduced 10x for stability)
+            _pitch_kp: 0.15,  // Was 2.0
+            _pitch_ki: 0.01,  // Was 0.1
+            _pitch_kd: 0.08,  // Was 0.5
+
+            _roll_kp: 0.12,   // Was 1.5
+            _roll_ki: 0.005,  // Was 0.05
+            _roll_kd: 0.06,   // Was 0.3
+
+            enabled: true, // FBW ON by default - F-16 requires computer stabilization
+            sas_enabled: true, // SAS ON by default - press K to disable (not recommended!)
+        }
+    }
+}
+
+#[derive(Component)]
+struct FlightCamera {
+    local_offset: Vec3,
+    rotation_lag_speed: f32,
+}
+
+impl Default for FlightCamera {
+    fn default() -> Self {
+        Self {
+            local_offset: Vec3::new(0.0, 5.0, 15.0),
+            rotation_lag_speed: 5.0, // Stiffer camera for high speed
+        }
+    }
+}
+
+// ============================================================================
+// AERODYNAMICS ENGINE (JSBSim Port)
+// ============================================================================
+
+/// Represents a 2D lookup table (x -> y)
+#[derive(Clone)]
+struct AeroCurve {
+    _points: Vec<(f32, f32)>,
+}
+
+impl AeroCurve {
+    fn new(points: Vec<(f32, f32)>) -> Self {
+        Self { _points: points }
+    }
+
+    fn sample(&self, x: f32) -> f32 {
+        if self._points.is_empty() { return 0.0; }
+        if x <= self._points[0].0 { return self._points[0].1; }
+        if x >= self._points.last().unwrap().0 { return self._points.last().unwrap().1; }
+
+        for i in 0..self._points.len() - 1 {
+            let (x0, y0) = self._points[i];
+            let (x1, y1) = self._points[i+1];
+            if x >= x0 && x <= x1 {
+                let t = (x - x0) / (x1 - x0);
+                return y0 + (y1 - y0) * t;
+            }
+        }
+        0.0
+    }
+}
+
+/// Stores the F-16 aerodynamic data (Curves extracted from f16.xml)
+#[derive(Resource)]
+struct F16AeroData {
+    // Coefficients
+    cl_alpha: AeroCurve, // Lift vs Alpha
+    cd_alpha: AeroCurve, // Drag vs Alpha
+    cy_beta: f32,        // Side force vs Beta (Scalar from XML: -1.146)
+    
+    // Stability Derivatives (Moments)
+    cm_alpha: AeroCurve, // Pitch moment vs Alpha (Stability)
+    cl_beta: AeroCurve,  // Roll moment vs Beta (Dihedral effect)
+    cn_beta: AeroCurve,  // Yaw moment vs Beta (Weathercock stability)
+    
+    // Control Authorities
+    cl_aileron: f32,     // Roll power (~0.05)
+    cm_elevator: f32,    // Pitch power (~-0.8)
+    cn_rudder: f32,      // Yaw power (~-0.05)
+    
+    // Damping
+    cl_p: f32, // Roll damping
+    cm_q: f32, // Pitch damping
+    cn_r: f32, // Yaw damping
+
+    // Physical Properties
+    wing_area: f32,  // 300 sq ft -> 27.87 m^2
+    wing_chord: f32, // 11.32 ft -> 3.45 m
+    wing_span: f32,  // 30 ft -> 9.14 m
+}
+
+impl Default for F16AeroData {
+    fn default() -> Self {
+        Self {
+            // Lift Coefficient (Alpha in Rads)
+            // Stalls around 35 degrees (0.61 rad)
+            cl_alpha: AeroCurve::new(vec![
+                (-0.17, -0.65), (0.00, 0.18), (0.17, 0.80), (0.35, 1.39), (0.61, 1.90), (0.80, 1.50)
+            ]),
+            
+            // Drag Coefficient (Increased for playability - prevents Mach 8 acceleration)
+            // Original values too low, plane accelerates infinitely
+            cd_alpha: AeroCurve::new(vec![
+                (0.00, 0.15), (0.17, 0.30), (0.35, 0.50), (0.61, 1.20), (1.57, 2.50)
+            ]),
+
+            cy_beta: -1.14,
+
+            // Pitch Moment (Cm) - More negative slope = More stable
+            // Increased stability to prevent pitch oscillations
+            cm_alpha: AeroCurve::new(vec![
+                (-0.17, 0.10), (0.00, 0.00), (0.17, -0.15), (0.35, -0.30)
+            ]),
+
+            // Roll Moment due to Beta (Dihedral)
+            // REDUCED by 10x to prevent uncontrollable roll divergence
+            cl_beta: AeroCurve::new(vec![
+                (-0.5, 0.005), (0.0, 0.0), (0.5, -0.005)
+            ]),
+
+            // Yaw Moment due to Beta (Weathercock)
+            // REDUCED by 5x to prevent uncontrollable yaw divergence
+            cn_beta: AeroCurve::new(vec![
+                (-0.5, -0.02), (0.0, 0.0), (0.5, 0.02)
+            ]),
+
+            // Control Powers (Further reduced for stable manual flight)
+            // Gentler inputs prevent overcontrol with increased damping
+            cl_aileron: 0.03,  // Roll power (reduced for gentle control)
+            cm_elevator: -0.25, // Pitch power (reduced for gentle control)
+            cn_rudder: -0.02,  // Yaw power (reduced for gentle control)
+
+            // PHASE 4: Damping Factors - MASSIVELY INCREASED for FBW stability
+            // Even with FBW, need strong damping to prevent runaway divergence
+            cl_p: -5.0,    // Roll damping (10x stronger - critical for preventing 100k deg/s spin)
+            cm_q: -10.0,   // Pitch damping (10x stronger - prevents pitch oscillation)
+            cn_r: -4.0,    // Yaw damping (8x stronger - prevents yaw departure)
+
+            // Geometry (Converted to Metric)
+            wing_area: 27.87,
+            wing_chord: 3.45,
+            wing_span: 9.14,
+        }
+    }
+}
+
+// ============================================================================
+// PHASE 3 COMPONENTS - Combat System
+// ============================================================================
+
+#[derive(Component)]
+struct Projectile {
+    lifetime: f32,
+}
+
+#[derive(Component)]
+struct LastShotTime {
+    time: f32,
+}
+
+impl Default for LastShotTime {
+    fn default() -> Self {
+        Self { time: -10.0 }
+    }
+}
+
+#[derive(Component)]
+struct MuzzleFlash {
+    lifetime: f32,
+}
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// F-16 Engine: F100-PW-229
+// Reduced for playability - realistic thrust causes Mach 8 acceleration
+// Target: Cruise at 200-300 m/s with manageable acceleration
+const MAX_THRUST_NEWTONS: f32 = 35_000.0; // Reduced from 130,000 N
+const MASS_KG: f32 = 9000.0; // Approx loaded weight
+
+const BULLET_SPEED: f32 = 600.0; // Faster bullets for scale
+const BULLET_LIFETIME: f32 = 3.0;
+const FIRE_RATE: f32 = 15.0;
+const FIRE_COOLDOWN: f32 = 1.0 / FIRE_RATE;
+const GUN_OFFSET: Vec3 = Vec3::new(0.0, 0.0, -3.0);
+const _BULLET_RADIUS: f32 = 0.1; // Reserved for future use
+const MUZZLE_FLASH_DURATION: f32 = 0.05;
+const MUZZLE_FLASH_INTENSITY: f32 = 500.0;
+
+// Missile visual dimensions
+const MISSILE_LENGTH: f32 = 2.0;
+const MISSILE_BODY_RADIUS: f32 = 0.15;
+const MISSILE_FIN_SIZE: f32 = 0.3;
+
+// ============================================================================
+// MAIN FUNCTION
+// ============================================================================
+
+fn main() {
+    App::new()
+        .add_plugins(DefaultPlugins)
+        .add_plugins(PhysicsPlugins::default())
+        .insert_resource(ClearColor(Color::srgb(0.5, 0.8, 1.0)))
+        .init_resource::<F16AeroData>() // Load Aero Data
+        .add_systems(Startup, setup_scene)
+        .add_systems(Startup, spawn_player)
+        .add_systems(Update, (
+            read_player_input,
+            arcade_flight_physics, // ARCADE PHYSICS: Direct control, no FBW interference
+            debug_flight_diagnostics, // New diagnostics system
+            update_afterburner_flame, // Flame visual effect based on throttle
+            check_ground_collision, // Ground collision + explosions
+            update_flight_camera,
+            debug_flight_data,
+            debug_flight_dynamics, // Detailed rotation/rate monitoring
+            handle_quit,
+            handle_restart, // R button to restart game
+            debug_asset_loading, // Debug model loading
+            // Combat
+            handle_shooting_input,
+            update_projectiles,
+            handle_projectile_collisions,
+            update_muzzle_flashes,
+            update_explosion_effects, // Clean up explosion effects
+        ))
+        .run();
+}
+
+// ============================================================================
+// SYSTEMS
+// ============================================================================
+
+fn setup_scene(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 30000.0,
+            shadows_enabled: true,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, 0.5, 0.0)),
+        GlobalTransform::default(),
+    ));
+
+    // Grid ground for visual reference
+    let ground_size = 10000.0; // Bigger ground for fast flight
+
+    // Create checkerboard material (alternating colors for grid effect)
+    let ground_mesh = meshes.add(Mesh::from(Plane3d::default().mesh().size(ground_size, ground_size)));
+    let checkerboard_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.2, 0.6, 0.2),  // Medium green
+        ..default()
+    });
+
+    commands.spawn((
+        Mesh3d(ground_mesh),
+        MeshMaterial3d(checkerboard_material),
+        Transform::from_xyz(0.0, -1.0, 0.0),
+        GlobalTransform::default(),
+        RigidBody::Static,
+        Collider::cuboid(ground_size / 2.0, 0.5, ground_size / 2.0),
+    ));
+
+    // Add a debug grid plane high above to show altitude/pitch reference
+    let debug_grid_size = 20000.0;
+    let debug_grid_mesh = meshes.add(Mesh::from(Plane3d::default().mesh().size(debug_grid_size, debug_grid_size)));
+    let debug_grid_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.4, 0.4, 1.0, 0.15),  // Light blue transparent
+        ..default()
+    });
+
+    commands.spawn((
+        Mesh3d(debug_grid_mesh),
+        MeshMaterial3d(debug_grid_material),
+        Transform::from_xyz(0.0, 3000.0, 0.0),  // High above, acts as "sky" reference
+        GlobalTransform::default(),
+    ));
+
+    // Add reference markers at cardinal directions
+    let marker_positions = vec![
+        (Vec3::new(5000.0, 50.0, 0.0), "X+"),      // Red: +X direction
+        (Vec3::new(-5000.0, 50.0, 0.0), "X-"),     // Red: -X direction
+        (Vec3::new(0.0, 50.0, 5000.0), "Z+"),      // Blue: +Z direction
+        (Vec3::new(0.0, 50.0, -5000.0), "Z-"),     // Blue: -Z direction
+    ];
+
+    for (pos, _label) in marker_positions {
+        let marker_mesh = meshes.add(Mesh::from(Sphere::new(100.0)));
+        let marker_material = if pos.x > 0.0 || pos.x < 0.0 {
+            materials.add(StandardMaterial {
+                base_color: Color::srgb(1.0, 0.0, 0.0),  // Red for X axis
+                emissive: Color::srgb(1.0, 0.0, 0.0).into(),
+                ..default()
+            })
+        } else {
+            materials.add(StandardMaterial {
+                base_color: Color::srgb(0.0, 0.0, 1.0),  // Blue for Z axis
+                emissive: Color::srgb(0.0, 0.0, 1.0).into(),
+                ..default()
+            })
+        };
+
+        commands.spawn((
+            Mesh3d(marker_mesh),
+            MeshMaterial3d(marker_material),
+            Transform::from_translation(pos),
+            GlobalTransform::default(),
+        ));
+    }
+
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(0.0, 50.0, 15.0).looking_at(Vec3::ZERO, Vec3::Y),
+        GlobalTransform::default(),
+    ));
+}
+
+fn spawn_player(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    // Print controls on startup
+    println!("\n╔══════════════════════════════════════════════╗");
+    println!("║       F-16 FIGHTER JET - CONTROLS           ║");
+    println!("╠══════════════════════════════════════════════╣");
+    println!("║  W/S        - Pitch Up/Down                  ║");
+    println!("║  A/D        - Roll Left/Right                ║");
+    println!("║  Q/E        - Yaw Left/Right                 ║");
+    println!("║  Shift      - Increase Throttle (Boost)      ║");
+    println!("║  Ctrl       - Decrease Throttle              ║");
+    println!("║  SPACE      - Fire Missiles                  ║");
+    println!("║  R          - Restart Game                   ║");
+    println!("║  ESC        - Quit                           ║");
+    println!("╚══════════════════════════════════════════════╝\n");
+
+    // Load the F-16 Template (High Quality)
+    let model_handle = asset_server.load("models/f16_template/scene.gltf#Scene0");
+    // Alternative: let model_handle = asset_server.load("models/low_poly_f16/scene.gltf#Scene0");
+    // Alternative: let model_handle = asset_server.load("models/fighter_jet_enhanced.gltf#Scene0");
+
+    let player = commands.spawn((
+        PlayerPlane,
+        Transform::from_xyz(0.0, 500.0, 0.0), // Start high up
+        GlobalTransform::default(),
+        Visibility::default(),
+        InheritedVisibility::default(),
+        RigidBody::Dynamic,
+        Mass(MASS_KG), // REAL MASS
+        LinearVelocity(Vec3::new(0.0, 0.0, -100.0)), // Start at 100 m/s - gentler start
+        AngularVelocity::default(),
+        ExternalForce::default(),
+        ExternalTorque::default(),
+        Collider::cuboid(2.0, 1.0, 4.0),
+        PlayerInput::default(),
+        FlightCamera::default(),
+    ))
+    .insert(FlightControlComputer::default())
+    .insert(DiagnosticTimer(Timer::from_seconds(0.5, TimerMode::Repeating)))
+    .insert(LastShotTime::default())
+    .id();
+
+    commands.entity(player)
+    .with_children(|parent| {
+        parent.spawn((
+            ModelContainer,
+            // Scale down model to fit game (typical GLTF exports are oversized)
+            // Rotate 180 degrees (PI radians) around Y to face forward (-Z)
+            Transform::from_scale(Vec3::splat(0.08))
+                .with_rotation(Quat::from_rotation_y(std::f32::consts::PI)),
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+            SceneRoot(model_handle),
+        ));
+
+        // Afterburner flame - two perpendicular planes from the rear exhaust
+        // This creates a "cross" visible from all angles
+        let flame_mesh = meshes.add(Rectangle::new(0.4, 0.6));  // Small rectangle
+        let flame_material = materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 0.5, 0.0, 0.5),  // Orange, semi-transparent
+            emissive: LinearRgba::rgb(4.0, 1.5, 0.0),      // Bright orange glow
+            unlit: true,                                    // Self-lit (no shadow needed)
+            double_sided: true,                             // Visible from both sides
+            ..default()
+        });
+
+        // First plane (vertical) at rear exhaust
+        parent.spawn((
+            AfterburnerFlame,
+            Mesh3d(flame_mesh.clone()),
+            MeshMaterial3d(flame_material.clone()),
+            Transform::from_xyz(0.0, 0.0, 3.0)  // At rear exhaust (Z+)
+                .with_scale(Vec3::splat(0.1)),   // Scale in model space
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+        ));
+
+        // Second plane (horizontal) perpendicular to first
+        parent.spawn((
+            Mesh3d(flame_mesh),
+            MeshMaterial3d(flame_material),
+            Transform::from_xyz(0.0, 0.0, 3.0)  // Same rear position
+                .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+                .with_scale(Vec3::splat(0.1)),
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+        ));
+    });
+}
+
+fn read_player_input(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut player_query: Query<(&mut PlayerInput, &AngularVelocity, &Transform, &mut FlightControlComputer), With<PlayerPlane>>,
+) {
+    for (mut input, _ang_vel, _transform, mut fbw) in &mut player_query {
+        // Toggle SAS with K key (for legacy FBW, not used with arcade physics)
+        if keyboard_input.just_pressed(KeyCode::KeyK) {
+            fbw.sas_enabled = !fbw.sas_enabled;
+            println!("⚙️  SAS: {}", if fbw.sas_enabled { "ENABLED ✓" } else { "DISABLED ⚠️" });
+        }
+        
+        // ARCADE PHYSICS: Full authority control (no SAS limiting)
+        // Pitch (W/S) - Direct control (inverted: W pitches down, S pitches up)
+        let target_pitch = if keyboard_input.pressed(KeyCode::KeyW) { -1.0 }
+                          else if keyboard_input.pressed(KeyCode::KeyS) { 1.0 }
+                          else { 0.0 };
+        input.pitch = input.pitch.lerp(target_pitch, 0.1);
+
+        // Roll (A/D) - Direct control
+        let target_roll = if keyboard_input.pressed(KeyCode::KeyA) { -1.0 }
+                         else if keyboard_input.pressed(KeyCode::KeyD) { 1.0 }
+                         else { 0.0 };
+        input.roll = input.roll.lerp(target_roll, 0.1);
+
+        // Yaw (Q/E) - Direct control
+        let target_yaw = if keyboard_input.pressed(KeyCode::KeyQ) { 1.0 } 
+                        else if keyboard_input.pressed(KeyCode::KeyE) { -1.0 } 
+                        else { 0.0 };
+        input.yaw = input.yaw.lerp(target_yaw, 0.1);
+
+        // Throttle (Shift/Ctrl)
+        if keyboard_input.pressed(KeyCode::ShiftLeft) {
+            input.throttle = (input.throttle + 0.01).min(1.0); // Afterburner
+        } else if keyboard_input.pressed(KeyCode::ControlLeft) {
+            input.throttle = (input.throttle - 0.01).max(0.0);
+        }
+    }
+}
+
+/// Fly-By-Wire Flight Control System
+/// Implements PID controllers to stabilize the inherently unstable F-16
+/// Adjusts PlayerInput values to match desired attitude
+#[allow(dead_code)]
+fn fly_by_wire_control(
+    time: Res<Time>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut player_query: Query<
+        (
+            &Transform,
+            &AngularVelocity,
+            &mut PlayerInput,
+            &mut FlightControlComputer,
+        ),
+        With<PlayerPlane>,
+    >,
+    mut debug_counter: Local<u32>,
+) {
+    for (transform, ang_vel, mut input, mut fbw) in &mut player_query {
+        // Toggle FBW with L key
+        if keyboard.just_pressed(KeyCode::KeyL) {
+            fbw.enabled = !fbw.enabled;
+            println!("🔧 FBW: {}", if fbw.enabled { "ENABLED" } else { "DISABLED" });
+        }
+
+        if !fbw.enabled {
+            return; // FBW disabled, pass through raw inputs
+        }
+
+        let dt = time.delta_secs();
+        if dt == 0.0 || dt > 0.1 { return; } // Skip if dt is 0 or suspiciously large
+
+        // Get current attitude (Euler angles)
+        let (current_roll, current_pitch, _current_yaw) = transform.rotation.to_euler(EulerRot::XYZ);
+
+        // Get current rotation rates
+        let omega = transform.rotation.inverse() * ang_vel.0;
+        let pitch_rate = omega.x;
+        let roll_rate = omega.z;
+
+        // SIMPLIFIED: Direct attitude command with gentle scaling
+        // Player input directly sets target attitude (not rate)
+        fbw._target_pitch = input.pitch * 0.15;  // ±0.15 rad = ±8.6° max
+        fbw._target_roll = input.roll * 0.25;    // ±0.25 rad = ±14° max
+
+        // If no input, auto-level aggressively
+        if input.pitch.abs() < 0.01 {
+            fbw._target_pitch = 0.0; // Level flight
+        }
+        if input.roll.abs() < 0.01 {
+            fbw._target_roll = 0.0; // Wings level
+        }
+
+        // ==========================
+        // PITCH PID CONTROLLER
+        // ==========================
+        let pitch_error = fbw._target_pitch - current_pitch;
+        fbw._pitch_error_integral += pitch_error * dt;
+        fbw._pitch_error_integral = fbw._pitch_error_integral.clamp(-1.0, 1.0); // Anti-windup
+
+        let pitch_error_derivative = (pitch_error - fbw._pitch_error_prev) / dt;
+        let pitch_error_derivative = pitch_error_derivative.clamp(-10.0, 10.0); // Prevent spikes
+        fbw._pitch_error_prev = pitch_error;
+
+        let pitch_correction =
+            fbw._pitch_kp * pitch_error +
+            fbw._pitch_ki * fbw._pitch_error_integral +
+            fbw._pitch_kd * pitch_error_derivative;
+
+        // PHASE 3: Normalize rates to [-1, 1] range before applying damping gains
+        // Real F-16 max pitch rate: ~300°/s = 5.24 rad/s
+        const MAX_PITCH_RATE: f32 = 5.0;  // rad/s
+        let normalized_pitch_rate = (pitch_rate / MAX_PITCH_RATE).clamp(-1.0, 1.0);
+
+        // Add active rate damping (fight unwanted rotation)
+        // Apply damping as normalized control input (max ±1.0)
+        // CRITICAL: Must be strong enough to overcome instability
+        let pitch_damping = -normalized_pitch_rate * 2.5;  // Was 0.5 - much stronger now
+
+        // ==========================
+        // ROLL PID CONTROLLER
+        // ==========================
+        let roll_error = fbw._target_roll - current_roll;
+        fbw._roll_error_integral += roll_error * dt;
+        fbw._roll_error_integral = fbw._roll_error_integral.clamp(-1.0, 1.0); // Anti-windup
+
+        let roll_error_derivative = (roll_error - fbw._roll_error_prev) / dt;
+        let roll_error_derivative = roll_error_derivative.clamp(-10.0, 10.0); // Prevent spikes
+        fbw._roll_error_prev = roll_error;
+
+        let roll_correction =
+            fbw._roll_kp * roll_error +
+            fbw._roll_ki * fbw._roll_error_integral +
+            fbw._roll_kd * roll_error_derivative;
+
+        // PHASE 3: Normalize roll rate for damping
+        const MAX_ROLL_RATE: f32 = 5.0;   // rad/s
+        let normalized_roll_rate = (roll_rate / MAX_ROLL_RATE).clamp(-1.0, 1.0);
+
+        // Add active rate damping (fight unwanted rotation)
+        let roll_damping = -normalized_roll_rate * 3.0;  // Was 0.5 - MUCH stronger to prevent divergence
+
+        // Apply corrections + damping to control inputs
+        // CRITICAL: When rates are extreme, damping MUST dominate over position correction
+        // PITCH: Negate correction (for control mapping) but keep damping sign correct
+        // Damping must always oppose rotation, so we add it directly without negation
+        input.pitch = (-pitch_correction * 0.3 + pitch_damping).clamp(-1.0, 1.0);
+
+        // ROLL: Reduce correction strength so damping can dominate when needed
+        input.roll = (roll_correction * 0.3 + roll_damping).clamp(-1.0, 1.0);
+
+        // Debug FBW every 30 frames (~0.5 seconds)
+        *debug_counter += 1;
+        if *debug_counter % 30 == 0 {
+            println!(
+                "🔧 FBW | Pitch: {:.2}° (tgt:{:.2}° rate:{:.2}rad/s corr:{:.3}) | Roll: {:.2}° (tgt:{:.2}° rate:{:.2}rad/s corr:{:.3})",
+                current_pitch.to_degrees(),
+                fbw._target_pitch.to_degrees(),
+                pitch_rate,
+                pitch_correction + pitch_damping,
+                current_roll.to_degrees(),
+                fbw._target_roll.to_degrees(),
+                roll_rate,
+                roll_correction + roll_damping,
+            );
+        }
+
+        // Yaw is still direct (rudder coordination can be added later)
+    }
+}
+
+/// The Heart of the Beast: JSBSim-style Physics
+#[allow(dead_code)]
+fn apply_aerodynamics(
+    mut player_query: Query<
+        (
+            &PlayerInput,
+            &Transform,
+            &LinearVelocity,
+            &AngularVelocity,
+            &mut ExternalForce,
+            &mut ExternalTorque,
+        ),
+        With<PlayerPlane>,
+    >,
+    aero: Res<F16AeroData>,
+    _time: Res<Time>,
+) {
+    let air_density = 1.225; // Sea Level density (kg/m^3)
+
+    for (input, transform, velocity, ang_vel, mut ext_force, mut ext_torque) in &mut player_query {
+        // 1. Get Velocity in Local Body Frame
+        // Bevy: -Z = Forward, Y = Up, X = Right
+        // Aero: X = Forward, Z = Down, Y = Right (We must map carefully)
+
+        let mut v_world = velocity.0;
+
+        // SPEED LIMITER: Cap max speed to prevent hypersonic runaway
+        const MAX_SPEED: f32 = 350.0; // m/s (~783 mph, above target for margin)
+        let current_speed = v_world.length();
+        if current_speed > MAX_SPEED {
+            v_world = v_world.normalize() * MAX_SPEED;
+            // Note: This doesn't update the actual velocity component,
+            // it just prevents forces from accelerating beyond this point
+        }
+
+        let v_body = transform.rotation.inverse() * v_world;
+        let speed_sq = v_world.length_squared();
+        let speed = v_world.length();
+
+        if speed < 1.0 {
+            // Apply simple thrust if stopped
+            let thrust = transform.forward() * input.throttle * MAX_THRUST_NEWTONS;
+            ext_force.apply_force(thrust);
+            continue;
+        }
+
+        // 2. Calculate Alpha (AoA) and Beta (Sideslip)
+        // Body Frame Mapping for calculation:
+        // Forward speed (u) = -v_body.z
+        // Side speed (v) = v_body.x
+        // Vertical speed (w) = v_body.y (Positive = Up, so flow coming from down)
+
+        // Alpha = atan2(w, u) -> atan2(Vertical, Forward)
+        // Note: If plane is falling flat, v_body.y is negative (falling).
+        // Flow is coming UP. Alpha should be positive.
+        // Alpha = atan2(-v_body.y, -v_body.z)
+        let alpha = (-v_body.y).atan2(-v_body.z);
+
+        // Beta = atan2(v, u) -> atan2(Side, Forward)
+        let beta = (v_body.x).atan2(-v_body.z);
+
+        // 3. Dynamic Pressure (Q-Bar)
+        let q_bar = 0.5 * air_density * speed_sq;
+        let s = aero.wing_area;
+        let b = aero.wing_span;
+        let c = aero.wing_chord;
+
+        // 4. Calculate Coefficients
+        let cl = aero.cl_alpha.sample(alpha);
+
+        // Drag: Base from alpha + airbrake + speed penalty
+        // Add exponential drag at high speeds to limit max velocity naturally
+        let speed_drag_factor = (speed / 200.0).powi(2) * 0.3; // Ramps up aggressively
+        let cd = aero.cd_alpha.sample(alpha) + 0.05 * input._brake + speed_drag_factor;
+
+        let cy = aero.cy_beta * beta;
+
+        // 5. Calculate Forces (Wind Frame)
+        // Lift acts Perpendicular to Velocity
+        // Drag acts Opposite to Velocity
+        let lift_mag = q_bar * s * cl;
+        let drag_mag = q_bar * s * cd;
+        let side_mag = q_bar * s * cy;
+
+        // Direction Vectors
+        let forward_dir = v_world.normalize(); // Direction of flight
+        let right_dir = transform.right().as_vec3(); // Wing axis
+        // Lift direction: Perpendicular to velocity and right wing.
+        // Effective "Up" relative to airflow.
+        let lift_dir = right_dir.cross(forward_dir).normalize();
+        let drag_dir = -forward_dir;
+        let side_dir = -right_dir; // Side force pushes opposite to slip
+
+        let lift_force = lift_dir * lift_mag;
+        let drag_force = drag_dir * drag_mag;
+        let side_force = side_dir * side_mag;
+
+        let thrust_force = transform.forward().as_vec3() * input.throttle * MAX_THRUST_NEWTONS;
+
+        let total_force = lift_force + drag_force + side_force + thrust_force;
+
+        // 6. Calculate Moments (Torque)
+        // M = Q * S * Length * Coeff
+
+        // Get Angular Rates in Body Frame
+        let mut omega = transform.rotation.inverse() * ang_vel.0;
+
+        // PHASE 1: CRITICAL SAFETY - Clamp angular velocity magnitude to prevent explosion
+        // Real F-16 max control rate: ~300°/s = 5.24 rad/s
+        // Allow 2x for aerodynamic effects: 10 rad/s = 573°/s
+        const MAX_ANGULAR_VELOCITY: f32 = 10.0; // rad/s
+        let omega_magnitude = omega.length();
+        if omega_magnitude > MAX_ANGULAR_VELOCITY {
+            omega = omega.normalize() * MAX_ANGULAR_VELOCITY;
+        }
+
+        // Bevy Axes:
+        // X = Right. Rot around X = Pitch.
+        // Y = Up. Rot around Y = Yaw.
+        // Z = Back. Rot around Z = Roll.
+
+        let pitch_rate = omega.x;
+        let yaw_rate = omega.y;
+        let roll_rate = omega.z;
+
+        // PHASE 2: Calculate normalized rates with protection against division by small speed
+        // and large rate values
+        const MIN_SPEED_FOR_DAMPING: f32 = 5.0; // m/s - below this, disable rate damping
+        let speed_for_damping = speed.max(MIN_SPEED_FOR_DAMPING);
+
+        let norm_p = (roll_rate * b) / (2.0 * speed_for_damping);
+        let norm_q = (pitch_rate * c) / (2.0 * speed_for_damping);
+        let norm_r = (yaw_rate * b) / (2.0 * speed_for_damping);
+
+        // Clamp normalized rates to reasonable bounds
+        // Real F-16: these should be in [-0.3, 0.3] range typically
+        const MAX_NORMALIZED_RATE: f32 = 1.0;
+        let norm_p = norm_p.clamp(-MAX_NORMALIZED_RATE, MAX_NORMALIZED_RATE);
+        let norm_q = norm_q.clamp(-MAX_NORMALIZED_RATE, MAX_NORMALIZED_RATE);
+        let norm_r = norm_r.clamp(-MAX_NORMALIZED_RATE, MAX_NORMALIZED_RATE);
+
+        // Coefficients
+        let cm = aero.cm_alpha.sample(alpha)
+               + aero.cm_elevator * input.pitch
+               + aero.cm_q * norm_q;
+
+        // EMERGENCY FIX: Scale down roll torque by 90% to prevent constant spinning
+        // Aerodynamic roll forces are overpowering FBW control authority
+        let cl_roll = (aero.cl_beta.sample(beta)
+                     + aero.cl_aileron * input.roll
+                     + aero.cl_p * norm_p) * 0.1;
+
+        let cn_yaw = aero.cn_beta.sample(beta)
+                   + aero.cn_rudder * input.yaw
+                   + aero.cn_r * norm_r;
+
+        // Torque Magnitude
+        let pitch_torque = q_bar * s * c * cm;
+        let roll_torque = q_bar * s * b * cl_roll;
+        let yaw_torque = q_bar * s * b * cn_yaw;
+
+        // Apply Torques (Bevy Frame)
+        // Pitch = X axis (Right) -> +X is Pitch Up
+        // Yaw = Y axis (Up) -> +Y is Yaw Left (Bevy is Right-Handed Y-Up) -> Aero +Cn is Yaw Right
+        // Roll = Z axis (Back) -> +Z is Roll Left (Bevy is Right-Handed Y-Up) -> Aero +Cl is Roll Right
+
+        // CORRECTION: Negate Yaw and Roll to match Bevy's coordinate system
+        let torque_local = Vec3::new(pitch_torque, -yaw_torque, -roll_torque);
+        let torque_world = transform.rotation * torque_local;
+
+        // APPLY PHYSICS
+        *ext_force = ExternalForce::default();
+        ext_force.apply_force(total_force);
+
+        *ext_torque = ExternalTorque::default();
+        ext_torque.apply_torque(torque_world);
+    }
+}
+
+// ============================================================================
+// ARCADE FLIGHT PHYSICS (DISABLED - Experimental alternative to JSBSim)
+// ============================================================================
+// Kept for reference - uncomment to use arcade physics instead of JSBSim
+/// ARCADE FLIGHT PHYSICS
+/// Direct control like Ace Combat / StarFox - 100% stable and playable
+/// Based on: F117A-remake (Bevy) and brihernandez's ArcadeJetFlightExample
+///
+/// This replaces the JSBSim aerodynamics with simple, fun, stable controls.
+/// Player input directly controls rotation rates - no complex feedback loops.
+fn arcade_flight_physics(
+    mut player_query: Query<
+        (
+            &PlayerInput,
+            &Transform,
+            &LinearVelocity,
+            &mut AngularVelocity,
+            &mut ExternalForce,
+        ),
+        With<PlayerPlane>,
+    >,
+) {
+    // ===== TUNING CONSTANTS =====
+    const ROLL_RATE: f32 = 2.5;
+    const PITCH_RATE: f32 = 1.8;
+    const YAW_RATE: f32 = 1.2;
+    const DRAG_COEFFICIENT: f32 = 0.1;
+    const MAX_THRUST_NEWTONS: f32 = 100000.0;  // INCREASED: Was 50000, now 100000 for sustained flight
+    const SMOOTHING_FACTOR: f32 = 0.15;
+    const BOOST_MULTIPLIER: f32 = 3.5;
+    const BOOST_THRESHOLD: f32 = 0.8;
+
+    for (input, transform, velocity, mut ang_vel, mut ext_force) in &mut player_query {
+        ext_force.clear();
+
+        // ===== 1. LOCAL-SPACE ROTATION (Gemini's elegant approach) =====
+        // Use transform basis vectors for proper 3D rotation in aircraft's local frame
+        let right = transform.right().as_vec3();
+        let up = transform.up().as_vec3();
+        let forward = transform.forward().as_vec3();
+
+        // Target rotation rates in LOCAL space (around plane's own axes)
+        let target_omega = right * input.pitch * PITCH_RATE +
+                          up * input.yaw * YAW_RATE +
+                          forward * input.roll * ROLL_RATE;
+
+        // Smooth interpolation for natural feel
+        ang_vel.0 = ang_vel.0.lerp(target_omega, SMOOTHING_FACTOR);
+
+        // ===== 2. DRAG =====
+        let speed = velocity.length();
+        if speed > 1.0 {
+            let drag_force = -velocity.0.normalize() * speed * speed * DRAG_COEFFICIENT;
+            ext_force.apply_force(drag_force);
+        }
+
+        // ===== 3. THRUST WITH VERTICAL COMPONENT (My approach, simplified) =====
+        // Get current pitch angle to decompose thrust
+        let (_, pitch_angle, _) = transform.rotation.to_euler(EulerRot::XYZ);
+
+        // Decompose thrust into forward and vertical components based on pitch
+        let vertical_component = input.throttle * MAX_THRUST_NEWTONS * pitch_angle.sin();
+        let forward_component = input.throttle * MAX_THRUST_NEWTONS * pitch_angle.cos();
+
+        // Apply boost multiplier when throttle is high
+        let boost_mult = if input.throttle > BOOST_THRESHOLD { BOOST_MULTIPLIER } else { 1.0 };
+
+        let thrust_force = (forward * forward_component + up * vertical_component) * boost_mult;
+        ext_force.apply_force(thrust_force);
+
+        // ===== 4. GRAVITY =====
+        // Handled by Avian3D - no manual application needed
+    }
+}
+
+fn update_afterburner_flame(
+    player_query: Query<&PlayerInput, With<PlayerPlane>>,
+    mut flame_query: Query<(&mut Transform, &mut MeshMaterial3d<StandardMaterial>), With<AfterburnerFlame>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if let Ok(input) = player_query.get_single() {
+        for (mut transform, material_handle) in &mut flame_query {
+            // Scale flame based on throttle (0.3 to 3.0 scale)
+            let scale = 0.3 + input.throttle * 2.7;
+            transform.scale = Vec3::splat(scale);
+
+            // Update flame color and emission
+            if let Some(material) = materials.get_mut(&material_handle.0) {
+                if input.throttle > 0.1 {
+                    // Bright orange at boost, dimmer at low throttle
+                    let emission_intensity = input.throttle * 5.0;
+                    material.emissive = LinearRgba::rgb(
+                        emission_intensity,                    // Red
+                        emission_intensity * 0.4,              // Green (makes orange)
+                        0.0                                    // Blue
+                    );
+
+                    // At boost threshold (80%), add white tint
+                    if input.throttle > 0.8 {
+                        let boost_intensity = (input.throttle - 0.8) * 5.0;
+                        material.emissive = LinearRgba::rgb(
+                            emission_intensity + boost_intensity * 2.0,
+                            emission_intensity * 0.4 + boost_intensity,
+                            boost_intensity * 0.5
+                        );
+                    }
+                } else {
+                    // Dim at idle
+                    material.emissive = LinearRgba::rgb(1.0, 0.3, 0.0);
+                }
+            }
+        }
+    }
+}
+
+fn update_flight_camera(
+    time: Res<Time>,
+    mut camera_query: Query<&mut Transform, (With<Camera3d>, Without<PlayerPlane>)>,
+    player_query: Query<(&Transform, &FlightCamera, &LinearVelocity), With<PlayerPlane>>,
+) {
+    if let (Ok(mut camera_transform), Ok((player_transform, _flight_camera, _velocity))) =
+        (camera_query.get_single_mut(), player_query.get_single()) {
+
+        // === STEP 1: Set camera position directly (no smoothing) ===
+        // Position: 15 units behind plane, 5 units above plane center
+        let local_offset = Vec3::new(0.0, 5.0, 15.0);
+        camera_transform.translation = player_transform.transform_point(local_offset);
+
+        // === STEP 2: Calculate desired camera rotation ===
+        // Camera looks at plane center, using plane's up vector as camera up
+        let look_target = player_transform.translation;
+        let camera_up = player_transform.up().as_vec3();
+
+        let temp_transform = Transform::IDENTITY
+            .with_translation(camera_transform.translation)
+            .looking_at(look_target, camera_up);
+
+        let target_rotation = temp_transform.rotation;
+
+        // === STEP 3: Smoothly rotate camera to follow plane ===
+        // Smooth rotation prevents jerky head movement (15 rad/s interpolation speed)
+        let t_rot = (15.0 * time.delta_secs()).min(1.0);
+        camera_transform.rotation =
+            camera_transform.rotation.slerp(target_rotation, t_rot);
+    }
+}
+
+/// SYSTEM: Print flight diagnostics every 0.5 seconds
+fn debug_flight_diagnostics(
+    time: Res<Time>,
+    mut timer_query: Query<&mut DiagnosticTimer>,
+    player_query: Query<
+        (
+            &Transform,
+            &LinearVelocity,
+            &AngularVelocity,
+            &PlayerInput,
+        ),
+        With<PlayerPlane>,
+    >,
+) {
+    let mut timer = match timer_query.get_single_mut() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    timer.0.tick(time.delta());
+    if !timer.0.just_finished() {
+        return;
+    }
+
+    if let Ok((transform, velocity, ang_vel, input)) = player_query.get_single() {
+        let altitude = transform.translation.y;
+        let climb_rate = velocity.0.y;
+        let speed = velocity.length();
+        let (yaw, pitch, roll) = transform.rotation.to_euler(EulerRot::YXZ);
+        
+        let roll_deg = roll.to_degrees();
+        let pitch_deg = pitch.to_degrees();
+        let yaw_deg = yaw.to_degrees();
+        
+        let turning = roll.abs() > 0.01 && pitch.abs() > 0.01;
+        let yaw_rate_deg_per_sec = (transform.rotation.inverse() * ang_vel.0).y.to_degrees();
+        let throttle_percent = (input.throttle * 100.0) as i32;
+
+        println!("═════════════════════════════════════════════════════════════════════");
+        println!("FLIGHT DIAGNOSTICS");
+        println!("─────────────────────────────────────────────────────────────────────");
+        println!("ALT: {:>5.0} m  |  CLIMB: {:>+6.1} m/s  |  SPEED: {:>3.0} m/s  |  THR: {:>2}%",
+            altitude, climb_rate, speed, throttle_percent);
+        println!("ROLL: {:>6.1}°  |  PITCH: {:>6.1}°  |  YAW: {:>6.1}°",
+            roll_deg, pitch_deg, yaw_deg);
+        println!("INPUTS: [Pitch: {:>4.1}][Roll: {:>4.1}][Yaw: {:>4.1}][Throttle: {:>4.1}]",
+            input.pitch, input.roll, input.yaw, input.throttle);
+        println!("─────────────────────────────────────────────────────────────────────");
+        println!("TURNING: {}  Yaw Rate: {:>5.1}°/s",
+            if turning { "YES" } else { "NO " }, yaw_rate_deg_per_sec);
+        println!("═════════════════════════════════════════════════════════════════════\n");
+    }
+}
+
+// ===================================================================
+// DEBUG SYSTEM - Flight Dynamics Monitor
+// ===================================================================
+fn debug_flight_dynamics(
+    time: Res<Time>,
+    mut last_debug: Local<f32>,
+    player_query: Query<(
+        &Transform,
+        &AngularVelocity,
+        &LinearVelocity,
+        &PlayerInput,
+        &FlightControlComputer
+    ), With<PlayerPlane>>,
+) {
+    // Only print every 0.5 seconds to avoid spam
+    *last_debug += time.delta_secs();
+    if *last_debug < 0.5 {
+        return;
+    }
+    *last_debug = 0.0;
+
+    if let Ok((transform, ang_vel, lin_vel, input, fbw)) = player_query.get_single() {
+        // Convert quaternion to Euler angles (in degrees)
+        let (yaw, pitch, roll) = transform.rotation.to_euler(bevy::math::EulerRot::YXZ);
+        let pitch_deg = pitch.to_degrees();
+        let roll_deg = roll.to_degrees();
+        let yaw_deg = yaw.to_degrees();
+
+        // Convert angular velocity to body frame (rad/s)
+        let omega = transform.rotation.inverse() * ang_vel.0;
+        let pitch_rate = omega.x; // rad/s
+        let roll_rate = omega.z;  // rad/s
+        let yaw_rate = omega.y;   // rad/s
+
+        // Convert to deg/s for readability
+        let pitch_rate_deg = pitch_rate.to_degrees();
+        let roll_rate_deg = roll_rate.to_degrees();
+        let yaw_rate_deg = yaw_rate.to_degrees();
+
+        // Speed
+        let speed = lin_vel.length();
+        let speed_kph = speed * 3.6;
+
+        // Print comprehensive flight state
+        println!("╔═══════════════════════════════════════════════════════════════════╗");
+        println!("║ FLIGHT DYNAMICS DEBUG                                             ║");
+        println!("╠═══════════════════════════════════════════════════════════════════╣");
+        println!("║ ATTITUDE:  Pitch: {:>6.1}°  Roll: {:>6.1}°  Yaw: {:>6.1}°         ║",
+                 pitch_deg, roll_deg, yaw_deg);
+        println!("║ RATES:     Pitch: {:>6.1}°/s  Roll: {:>6.1}°/s  Yaw: {:>6.1}°/s   ║",
+                 pitch_rate_deg, roll_rate_deg, yaw_rate_deg);
+        println!("║ SPEED:     {:>5.0} m/s ({:>4.0} kph)                                ║",
+                 speed, speed_kph);
+        println!("║ INPUTS:    Pitch: {:>5.2}  Roll: {:>5.2}  Yaw: {:>5.2}  Thr: {:>4.1}%  ║",
+                 input.pitch, input.roll, input.yaw, input.throttle * 100.0);
+        println!("║ SYSTEMS:   FBW: {}  SAS: {}                                ║",
+                 if fbw.enabled { "ON ✓" } else { "OFF " },
+                 if fbw.sas_enabled { "ON ✓" } else { "OFF⚠" });
+        println!("╚═══════════════════════════════════════════════════════════════════╝");
+    }
+}
+
+// ===================================================================
+// CRITICAL SAFETY: Hard limit angular velocity to prevent physics explosion
+// ===================================================================
+/// This runs AFTER aerodynamics applies torques, clamping the resulting velocity
+/// Without this, the unstable F-16 aerodynamics cause exponential divergence
+#[allow(dead_code)]
+fn clamp_angular_velocity(
+    mut query: Query<&mut AngularVelocity, With<PlayerPlane>>,
+) {
+    // Maximum safe angular velocity: 10 rad/s = ~573°/s
+    // Real F-16 max roll rate: ~270°/s, we allow 2x for arcade feel
+    const MAX_ANGULAR_VELOCITY: f32 = 10.0; // rad/s
+
+    for mut ang_vel in &mut query {
+        let magnitude = ang_vel.0.length();
+        if magnitude > MAX_ANGULAR_VELOCITY {
+            // Preserve direction, limit magnitude
+            // This physically prevents the component from exceeding safe values
+            ang_vel.0 = ang_vel.0.normalize() * MAX_ANGULAR_VELOCITY;
+        }
+    }
+}
+
+
+fn debug_flight_data(
+    mut counter: Local<u32>,
+    player_query: Query<(&Transform, &LinearVelocity, &PlayerInput, &Mass), With<PlayerPlane>>,
+) {
+    *counter += 1;
+    if *counter % 30 == 0 { 
+        if let Ok((transform, velocity, input, mass)) = player_query.get_single() {
+            let speed = velocity.length();
+            let altitude = transform.translation.y;
+            println!(
+                "ALT: {:.0} m | SPD: {:.0} m/s ({:.0} kph) | THR: {:.0}% | Mass: {:.0}kg",
+                altitude,
+                speed,
+                speed * 3.6,
+                input.throttle * 100.0,
+                mass.0
+            );
+        }
+    }
+}
+
+fn handle_quit(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut exit: EventWriter<AppExit>,
+) {
+    if keyboard_input.pressed(KeyCode::Escape) {
+        exit.send(AppExit::Success);
+    }
+}
+
+fn handle_restart(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut player_query: Query<
+        (
+            &mut Transform,
+            &mut LinearVelocity,
+            &mut AngularVelocity,
+            &mut PlayerInput,
+            &mut FlightControlComputer,
+        ),
+        With<PlayerPlane>,
+    >,
+) {
+    if keyboard_input.just_pressed(KeyCode::KeyR) {
+        if let Ok((mut transform, mut lin_vel, mut ang_vel, mut input, mut fbw)) =
+            player_query.get_single_mut()
+        {
+            // Reset position to spawn point
+            transform.translation = Vec3::new(0.0, 500.0, 0.0);
+            transform.rotation = Quat::IDENTITY;
+
+            // Reset velocity and rotation
+            lin_vel.0 = Vec3::new(0.0, 0.0, -100.0);
+            ang_vel.0 = Vec3::ZERO;
+
+            // Reset input state
+            *input = PlayerInput::default();
+
+            // Reset FBW state
+            *fbw = FlightControlComputer::default();
+
+            println!("\n🔄 GAME RESTARTED\n");
+        }
+    }
+}
+
+fn debug_asset_loading(
+    mut loaded: Local<bool>,
+    scenes: Query<&SceneRoot>,
+    asset_server: Res<AssetServer>,
+) {
+    if !*loaded && !scenes.is_empty() {
+        for scene in &scenes {
+            let load_state = asset_server.load_state(&scene.0);
+            println!("Model load state: {:?}", load_state);
+            if matches!(load_state, bevy::asset::LoadState::Loaded) {
+                println!("✓ Fighter jet model loaded successfully!");
+                *loaded = true;
+            }
+        }
+    }
+}
+
+fn handle_shooting_input(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    mut player_query: Query<(&Transform, &mut LastShotTime), With<PlayerPlane>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if let Ok((player_transform, mut last_shot)) = player_query.get_single_mut() {
+        let current_time = time.elapsed_secs();
+        let can_shoot = keyboard.pressed(KeyCode::Space)
+            && (current_time - last_shot.time >= FIRE_COOLDOWN);
+
+        if can_shoot {
+            let gun_position_world = player_transform.transform_point(GUN_OFFSET);
+            let forward = -player_transform.local_z();
+            let bullet_velocity = forward * BULLET_SPEED;
+
+            // Spawn missile with proper orientation and visuals
+            spawn_missile(&mut commands, &mut meshes, &mut materials, gun_position_world, player_transform.rotation, bullet_velocity);
+            
+            spawn_muzzle_flash(&mut commands, gun_position_world);
+            last_shot.time = current_time;
+        }
+    }
+}
+
+fn update_projectiles(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut projectile_query: Query<(Entity, &mut Projectile)>,
+) {
+    for (entity, mut projectile) in &mut projectile_query {
+        projectile.lifetime -= time.delta_secs();
+        if projectile.lifetime <= 0.0 {
+            commands.entity(entity).despawn_recursive();
+        }
+    }
+}
+
+fn handle_projectile_collisions(
+    mut collision_events: EventReader<Collision>,
+    projectile_query: Query<Entity, With<Projectile>>,
+    ground_query: Query<Entity, (With<Collider>, Without<Projectile>, Without<PlayerPlane>)>,
+    mut commands: Commands,
+) {
+    for Collision(contacts) in collision_events.read() {
+        let projectile_entity = if projectile_query.contains(contacts.entity1) {
+            Some(contacts.entity1)
+        } else if projectile_query.contains(contacts.entity2) {
+            Some(contacts.entity2)
+        } else {
+            None
+        };
+        
+        if let Some(bullet) = projectile_entity {
+            let other_entity = if bullet == contacts.entity1 {
+                contacts.entity2
+            } else {
+                contacts.entity1
+            };
+            
+            if ground_query.contains(other_entity) {
+                commands.entity(bullet).despawn_recursive();
+            }
+        }
+    }
+}
+
+fn update_muzzle_flashes(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut flash_query: Query<(Entity, &mut MuzzleFlash)>,
+) {
+    for (entity, mut flash) in &mut flash_query {
+        flash.lifetime += time.delta_secs();
+        if flash.lifetime >= MUZZLE_FLASH_DURATION {
+            commands.entity(entity).despawn_recursive();
+        }
+    }
+}
+
+fn spawn_muzzle_flash(commands: &mut Commands, position: Vec3) {
+    commands.spawn((
+        MuzzleFlash { lifetime: 0.0 },
+        PointLight {
+            intensity: MUZZLE_FLASH_INTENSITY,
+            color: Color::srgb(1.0, 0.9, 0.5),
+            range: 10.0,
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::from_translation(position),
+        GlobalTransform::default(),
+        Visibility::default(),
+        InheritedVisibility::default(),
+    ));
+}
+
+/// Spawn a realistic-looking missile (AIM-120 style)
+fn spawn_missile(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    position: Vec3,
+    orientation: Quat,
+    velocity: Vec3,
+) {
+    // Create missile body (elongated cylinder pointing along -Z)
+    let body_mesh = meshes.add(Cylinder::new(MISSILE_BODY_RADIUS, MISSILE_LENGTH));
+    let body_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.8, 0.8, 0.8), // Light gray
+        metallic: 0.8,
+        perceptual_roughness: 0.2,
+        ..default()
+    });
+
+    // Nose cone material (red tip)
+    let nose_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.8, 0.1, 0.1), // Dark red
+        metallic: 0.5,
+        ..default()
+    });
+
+    // Exhaust glow material
+    let exhaust_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.5, 0.0), // Orange
+        emissive: LinearRgba::rgb(5.0, 2.0, 0.0), // Bright orange glow
+        ..default()
+    });
+
+    // Spawn missile parent entity with physics
+    commands.spawn((
+        Projectile { lifetime: BULLET_LIFETIME },
+        Transform::from_translation(position)
+            .with_rotation(orientation),
+        GlobalTransform::default(),
+        Visibility::default(),
+        InheritedVisibility::default(),
+        RigidBody::Dynamic,
+        LinearVelocity(velocity),
+        Collider::capsule(MISSILE_BODY_RADIUS, MISSILE_LENGTH),
+        GravityScale(0.0),
+    ))
+    .with_children(|parent| {
+        // Missile body (rotated 90° because Bevy's Cylinder is Y-axis aligned)
+        parent.spawn((
+            Mesh3d(body_mesh),
+            MeshMaterial3d(body_material),
+            Transform::from_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+        ));
+
+        // Nose cone (small sphere at front)
+        parent.spawn((
+            Mesh3d(meshes.add(Sphere::new(MISSILE_BODY_RADIUS * 1.2))),
+            MeshMaterial3d(nose_material.clone()),
+            Transform::from_xyz(0.0, 0.0, -MISSILE_LENGTH * 0.6),
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+        ));
+
+        // Exhaust glow (small sphere at back)
+        parent.spawn((
+            Mesh3d(meshes.add(Sphere::new(MISSILE_BODY_RADIUS * 0.8))),
+            MeshMaterial3d(exhaust_material),
+            Transform::from_xyz(0.0, 0.0, MISSILE_LENGTH * 0.6),
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+        ));
+
+        // Add 4 fins (small boxes around the body)
+        let fin_mesh = meshes.add(Cuboid::new(MISSILE_FIN_SIZE, 0.02, MISSILE_FIN_SIZE));
+        let fin_material = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.3, 0.3, 0.3), // Dark gray
+            metallic: 0.9,
+            ..default()
+        });
+
+        // Fins at 90° intervals
+        for i in 0..4 {
+            let angle = i as f32 * std::f32::consts::FRAC_PI_2;
+            let offset = Vec3::new(
+                angle.cos() * MISSILE_BODY_RADIUS * 1.5,
+                angle.sin() * MISSILE_BODY_RADIUS * 1.5,
+                0.0,
+            );
+            
+            parent.spawn((
+                Mesh3d(fin_mesh.clone()),
+                MeshMaterial3d(fin_material.clone()),
+                Transform::from_translation(offset),
+                GlobalTransform::default(),
+                Visibility::default(),
+                InheritedVisibility::default(),
+            ));
+        }
+    });
+}
+/// Component for explosion effects that despawn after a time
+#[derive(Component)]
+struct ExplosionEffect {
+    lifetime: f32,
+    max_lifetime: f32,
+}
+
+/// Check for ground collision and create explosion effect
+fn check_ground_collision(
+    mut commands: Commands,
+    mut player_query: Query<(Entity, &mut Transform, &mut LinearVelocity), With<PlayerPlane>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    const GROUND_LEVEL: f32 = 0.0;
+
+    for (_entity, mut transform, mut velocity) in &mut player_query {
+        if transform.translation.y <= GROUND_LEVEL {
+            let crash_speed = velocity.length();
+
+            if crash_speed > 50.0 {
+                println!("💥 MASSIVE EXPLOSION! Speed: {:.0} m/s", crash_speed);
+                spawn_huge_explosion(&mut commands, &mut meshes, &mut materials, transform.translation);
+                
+                // Reset plane
+                transform.translation = Vec3::new(0.0, 500.0, 0.0);
+                *velocity = LinearVelocity(Vec3::new(0.0, 0.0, -200.0));
+            } else {
+                transform.translation.y = GROUND_LEVEL + 1.0;
+                velocity.y = velocity.y.max(0.0);
+            }
+        }
+    }
+}
+
+/// Spawn a huge explosion with particles and light
+fn spawn_huge_explosion(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    position: Vec3,
+) {
+    let fireball_mesh = meshes.add(Sphere::new(15.0));
+    let fireball_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.3, 0.0),
+        emissive: LinearRgba::rgb(10.0, 3.0, 0.0),
+        ..default()
+    });
+
+    commands.spawn((
+        Mesh3d(fireball_mesh),
+        MeshMaterial3d(fireball_material),
+        Transform::from_translation(position + Vec3::Y * 10.0),
+        GlobalTransform::default(),
+        Visibility::default(),
+        InheritedVisibility::default(),
+        ExplosionEffect { lifetime: 0.0, max_lifetime: 2.0 },
+    ));
+
+    commands.spawn((
+        PointLight {
+            intensity: 50000.0,
+            color: Color::srgb(1.0, 0.6, 0.2),
+            range: 200.0,
+            shadows_enabled: true,
+            ..default()
+        },
+        Transform::from_translation(position + Vec3::Y * 10.0),
+        GlobalTransform::default(),
+        Visibility::default(),
+        InheritedVisibility::default(),
+        ExplosionEffect { lifetime: 0.0, max_lifetime: 1.0 },
+    ));
+
+    for i in 0..20 {
+        let angle = (i as f32 / 20.0) * std::f32::consts::TAU;
+        let speed = 50.0 + (i as f32 * 5.0);
+        let debris_velocity = Vec3::new(
+            angle.cos() * speed,
+            30.0 + (i as f32 * 2.0),
+            angle.sin() * speed,
+        );
+
+        let debris_mesh = meshes.add(Sphere::new(0.5));
+        let debris_material = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.3, 0.3, 0.3),
+            metallic: 0.8,
+            ..default()
+        });
+
+        commands.spawn((
+            Mesh3d(debris_mesh),
+            MeshMaterial3d(debris_material),
+            Transform::from_translation(position),
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+            RigidBody::Dynamic,
+            LinearVelocity(debris_velocity),
+            GravityScale(1.0),
+            ExplosionEffect { lifetime: 0.0, max_lifetime: 5.0 },
+        ));
+    }
+}
+
+/// Update and despawn explosion effects
+fn update_explosion_effects(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut query: Query<(Entity, &mut ExplosionEffect)>,
+) {
+    for (entity, mut effect) in &mut query {
+        effect.lifetime += time.delta_secs();
+        if effect.lifetime >= effect.max_lifetime {
+            commands.entity(entity).despawn_recursive();
+        }
+    }
+}

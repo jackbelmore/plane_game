@@ -1,0 +1,91 @@
+{
+  "asset": {
+    "version": "2.0",
+    "generator": "Gemini-Procedural-Enemy"
+  },
+  "scenes": [
+    {
+      "nodes": [
+        0
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "mesh": 0,
+      "name": "BlackStealth"
+    }
+  ],
+  "meshes": [
+    {
+      "name": "BlackStealth",
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 1
+          },
+          "indices": 0,
+          "material": 0
+        }
+      ]
+    }
+  ],
+  "materials": [
+    {
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          0.1,
+          0.1,
+          0.15,
+          1.0
+        ],
+        "metallicFactor": 0.1,
+        "roughnessFactor": 0.4
+      }
+    }
+  ],
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5123,
+      "count": 36,
+      "type": "SCALAR"
+    },
+    {
+      "bufferView": 1,
+      "componentType": 5126,
+      "count": 9,
+      "type": "VEC3",
+      "max": [
+        1.8,
+        0.3,
+        0.8
+      ],
+      "min": [
+        -1.8,
+        -0.1,
+        -3.0
+      ]
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 108,
+      "byteLength": 72,
+      "target": 34963
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 108,
+      "target": 34962
+    }
+  ],
+  "buffers": [
+    {
+      "byteLength": 180,
+      "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAEDAAAAAAJqZmT4AAAC/mpkZPwAAAADNzEw/mpkZvwAAAADNzEw/AAAAAM3MzL0AAAAAZmbmP83MzL3NzEw/Zmbmv83MzL3NzEw/zczMPgAAAAAAAIC/zczMvgAAAAAAAIC/AAABAAcAAAAHAAIAAAACAAQAAAAEAAMAAAADAAgAAAAIAAEAAQACAAcAAQADAAIAAQAIAAMABAACAAMABwAFAAIACAADAAYA"
+    }
+  ]
+}

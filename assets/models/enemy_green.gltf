@@ -1,0 +1,91 @@
+{
+  "asset": {
+    "version": "2.0",
+    "generator": "Gemini-Procedural-Enemy"
+  },
+  "scenes": [
+    {
+      "nodes": [
+        0
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "mesh": 0,
+      "name": "GreenDefender"
+    }
+  ],
+  "meshes": [
+    {
+      "name": "GreenDefender",
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 1
+          },
+          "indices": 0,
+          "material": 0
+        }
+      ]
+    }
+  ],
+  "materials": [
+    {
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          0.3,
+          0.4,
+          0.2,
+          1.0
+        ],
+        "metallicFactor": 0.3,
+        "roughnessFactor": 0.9
+      }
+    }
+  ],
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5123,
+      "count": 36,
+      "type": "SCALAR"
+    },
+    {
+      "bufferView": 1,
+      "componentType": 5126,
+      "count": 12,
+      "type": "VEC3",
+      "max": [
+        2.5,
+        1.0,
+        1.2
+      ],
+      "min": [
+        -2.5,
+        -0.4,
+        -1.8
+      ]
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 144,
+      "byteLength": 72,
+      "target": 34963
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 144,
+      "target": 34962
+    }
+  ],
+  "buffers": [
+    {
+      "byteLength": 216,
+      "uri": "data:application/octet-stream;base64,AAAAAAAAAABmZua/AAAAAJqZGT/NzEy+AAAAPwAAAACamZk/AAAAvwAAAACamZk/AAAAAM3MzL4AAAA/AAAgQAAAAAAAAAAAAAAgwAAAAAAAAAAAAAAgQAAAAADNzEw/AAAgwAAAAADNzEw/AAAAPwAAAAAAAAAAAAAAvwAAAAAAAAAAAAAAAAAAgD+amZk/AAABAAIAAAACAAQAAAAEAAMAAAADAAEABAACAAMAAQADAAIACQAFAAcACQAHAAIACgAIAAYACgADAAgAAQALAAIAAQADAAsA"
+    }
+  ]
+}

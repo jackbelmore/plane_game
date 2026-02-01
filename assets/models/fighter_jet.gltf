@@ -1,0 +1,89 @@
+{
+  "asset": {
+    "version": "2.0",
+    "generator": "Gemini-Procedural"
+  },
+  "scenes": [
+    {
+      "nodes": [
+        0
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "mesh": 0
+    }
+  ],
+  "meshes": [
+    {
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 1
+          },
+          "indices": 0,
+          "material": 0
+        }
+      ]
+    }
+  ],
+  "materials": [
+    {
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          0.7,
+          0.7,
+          0.8,
+          1.0
+        ],
+        "metallicFactor": 0.8,
+        "roughnessFactor": 0.2
+      }
+    }
+  ],
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5123,
+      "count": 42,
+      "type": "SCALAR"
+    },
+    {
+      "bufferView": 1,
+      "componentType": 5126,
+      "count": 11,
+      "type": "VEC3",
+      "max": [
+        2.0,
+        0.8,
+        1.0
+      ],
+      "min": [
+        -2.0,
+        -0.2,
+        -2.0
+      ]
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 132,
+      "byteLength": 84,
+      "target": 34963
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 132,
+      "target": 34962
+    }
+  ],
+  "buffers": [
+    {
+      "byteLength": 216,
+      "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAADAAAAAAAAAAD8AAAC/mpmZPgAAAAAAAIA/mpmZvgAAAAAAAIA/AAAAAM3MTL4AAAAAAAAAQAAAAAAAAAA/AAAAwAAAAAAAAAA/AAAAPwAAAAAAAAC/AAAAvwAAAAAAAAC/AAAAAM3MTD8AAIA/AAAAAAAAAAAAAAA/AAABAAcAAAAHAAIAAAACAAQAAAAEAAMAAAADAAgAAAAIAAEAAQACAAcAAQADAAIAAQAIAAMABAACAAMABwAFAAIACAADAAYACgAJAAIACgADAAkA"
+    }
+  ]
+}

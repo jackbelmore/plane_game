@@ -1,0 +1,24 @@
+[package]
+name = "plane_game"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Removed dynamic_linking due to linker issues on Windows
+bevy = { version = "0.15" }
+avian3d = { version = "0.2", features = ["f32"] }
+
+# Development Profile (cargo run)
+[profile.dev]
+opt-level = 1
+
+# Optimize dependencies even in debug mode (makes game run fast, compile slow once)
+[profile.dev.package."*"]
+opt-level = 3
+
+# Release Profile (cargo run --release)
+[profile.release]
+opt-level = 3
+lto = "thin"        # CHANGED: 'thin' is much faster than 'true' and parallelizes better
+codegen-units = 16  # CHANGED: Allows splitting the work across 16 threads
+strip = true        # Removes debug symbols to make the .exe smaller
