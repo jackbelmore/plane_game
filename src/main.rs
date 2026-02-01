@@ -1,26 +1,118 @@
 use bevy::prelude::*;
 use avian3d::prelude::*;
 use rand::prelude::*;
+use std::io::Write;
+
+// #region agent log
+fn debug_log(location: &str, message: &str, data: &str, hypothesis_id: &str) {
+    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let line = format!(
+        r#"{{"timestamp":{},"location":"{}","message":"{}","data":{},"sessionId":"debug-session","hypothesisId":"{}"}}"#,
+        timestamp, esc(location), esc(message), data, hypothesis_id
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(r"c:\Users\Box\plane_game\.cursor\debug.log") {
+        let _ = writeln!(f, "{}", line);
+    }
+}
+// #endregion
 
 // ============================================================================
 // COMPONENTS - Data containers for game entities
 // ============================================================================
 
-/// Afterburner flame effect component
+/// Afterburner particle emitter component
 #[derive(Component)]
-struct AfterburnerFlame {
-    flame_textures: Vec<Handle<Image>>,
-    timer: Timer,
-    current_frame: usize,
+struct AfterburnerParticles {
+    spawn_rate: f32,
+    spawn_threshold: f32,
+    particle_lifetime: f32,
+}
+
+impl Default for AfterburnerParticles {
+    fn default() -> Self {
+        Self {
+            spawn_rate: 5.0,
+            spawn_threshold: 0.2,
+            particle_lifetime: 0.8,
+        }
+    }
+}
+
+/// Individual particle component
+#[derive(Component)]
+struct Particle {
+    lifetime_remaining: f32,
+    lifetime_max: f32,
+    velocity: Vec3,
 }
 
 /// Marker component for meteors
 #[derive(Component)]
 struct Meteor;
 
+/// Marker component for mission objectives
+#[derive(Component)]
+struct Objective;
+
+/// Enemy turret component
+#[derive(Component)]
+struct Turret {
+    fire_timer: Timer,
+}
+
 /// Marker component to identify the player plane parent
 #[derive(Component)]
 struct PlayerPlane;
+
+/// Marker for village buildings
+#[derive(Component)]
+struct VillageBuilding;
+
+/// Marker for village roads
+#[derive(Component)]
+struct VillageRoad;
+
+/// Marker for village decorations (fences, hedges, etc)
+#[derive(Component)]
+struct VillageDecoration;
+
+/// Resource to store sound handles
+#[derive(Resource)]
+struct SoundAssets {
+    engine_loop: Handle<AudioSource>,
+    missile_launch: Handle<AudioSource>,
+    explosion: Handle<AudioSource>,
+    warning: Handle<AudioSource>,
+    crash: Handle<AudioSource>,
+    wind: Handle<AudioSource>,
+}
+
+impl FromWorld for SoundAssets {
+    fn from_world(world: &mut World) -> Self {
+        let asset_server = world.resource::<AssetServer>();
+        Self {
+            engine_loop: asset_server.load("sounds/engine.ogg"),
+            missile_launch: asset_server.load("sounds/missile.ogg"),
+            explosion: asset_server.load("sounds/explosion.ogg"),
+            warning: asset_server.load("sounds/warning.ogg"),
+            crash: asset_server.load("sounds/crash.ogg"),
+            wind: asset_server.load("sounds/wind.ogg"),
+        }
+    }
+}
+
+/// Marker for the active engine sound entity
+#[derive(Component)]
+struct EngineSound;
+
+/// Marker for the wind sound entity
+#[derive(Component)]
+struct WindSound;
+
+/// Marker for the warning sound entity
+#[derive(Component)]
+struct WarningSound;
 
 /// Marker for the container that holds the visual model
 /// Allowing us to rotate the model (e.g. for banking) without affecting physics
@@ -114,15 +206,15 @@ impl Default for FlightControlComputer {
 
 #[derive(Component)]
 struct FlightCamera {
-    local_offset: Vec3,
-    rotation_lag_speed: f32,
+    _local_offset: Vec3,
+    _rotation_lag_speed: f32,
 }
 
 impl Default for FlightCamera {
     fn default() -> Self {
         Self {
-            local_offset: Vec3::new(0.0, 5.0, 15.0),
-            rotation_lag_speed: 5.0, // Stiffer camera for high speed
+            _local_offset: Vec3::new(0.0, 5.0, 15.0),
+            _rotation_lag_speed: 5.0, // Stiffer camera for high speed
         }
     }
 }
@@ -302,22 +394,31 @@ fn main() {
         .add_plugins(PhysicsPlugins::default())
         .insert_resource(ClearColor(Color::srgb(0.05, 0.05, 0.1))) // Darker space color
         .init_resource::<F16AeroData>() // Load Aero Data
+        .init_resource::<SoundAssets>() // NEW: Load Sounds
         .add_systems(Startup, setup_scene)
+        .add_systems(Startup, spawn_village) // NEW: Spawn Angerdorf village
         .add_systems(Startup, spawn_meteors) // NEW: Spawn obstacles
+        .add_systems(Startup, spawn_objectives) // NEW: Spawn targets
+        .add_systems(Startup, spawn_turrets) // NEW: Spawn enemies
         .add_systems(Startup, spawn_player)
+        .add_systems(PreUpdate, check_ground_collision) // Before physics so AABB never sees invalid state
+        // Bevy has a 20-system tuple limit per add_systems; split to avoid overflow when adding more
         .add_systems(Update, (
             read_player_input,
             arcade_flight_physics, // ARCADE PHYSICS: Direct control, no FBW interference
+            update_turrets, // NEW: Turret AI
+            update_engine_audio, // NEW: Dynamic engine sound
             debug_flight_diagnostics, // New diagnostics system
-            update_afterburner_flame, // Flame visual effect based on throttle
-            check_ground_collision, // Ground collision + explosions
+            spawn_afterburner_particles, // Particle spawning based on throttle
+            update_particles, // Update particle positions and fade
             update_flight_camera,
             debug_flight_data,
             debug_flight_dynamics, // Detailed rotation/rate monitoring
+        ))
+        .add_systems(Update, (
             handle_quit,
             handle_restart, // R button to restart game
             debug_asset_loading, // Debug model loading
-            // Combat
             handle_shooting_input,
             update_projectiles,
             handle_projectile_collisions,
@@ -412,11 +513,153 @@ fn setup_scene(
         ));
     }
 
+    // Bevy 0.15: use DistanceFog (FogSettings was renamed/deprecated)
     commands.spawn((
         Camera3d::default(),
+        DistanceFog {
+            color: Color::srgba(0.05, 0.05, 0.1, 1.0), // Match space feel
+            falloff: FogFalloff::Linear {
+                start: 5000.0,
+                end: 10000.0,
+            },
+            ..default()
+        },
         Transform::from_xyz(0.0, 50.0, 15.0).looking_at(Vec3::ZERO, Vec3::Y),
         GlobalTransform::default(),
     ));
+}
+
+/// NEW: Spawn Angerdorf-style village (buildings arranged around central plaza)
+/// This is a historically accurate medieval village layout with:
+/// - Central green plaza
+/// - Buildings arranged in a circle around the plaza
+/// - Roads connecting buildings
+/// - Decorative elements (fences, hedges)
+fn spawn_village(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+) {
+    // Village center position
+    const VILLAGE_CENTER_X: f32 = -2000.0;  // Offset from player spawn
+    const VILLAGE_CENTER_Z: f32 = -2000.0;
+    const VILLAGE_CENTER_Y: f32 = -0.5;    // At ground level
+
+    // Plaza dimensions
+    const PLAZA_RADIUS: f32 = 150.0;  // Central green area
+    const BUILDING_DISTANCE: f32 = 300.0;  // Distance from plaza center to buildings
+
+    // Building arrangement in circle (Angerdorf layout)
+    const NUM_BUILDINGS: usize = 8;  // 8 buildings around plaza
+
+    // Simple building components to use
+    let wall_models = vec![
+        "fantasy_town/wall.glb#Scene0",
+        "fantasy_town/wall-wooden.glb#Scene0",
+    ];
+
+    let roof_models = vec![
+        "fantasy_town/roof-gable.glb#Scene0",
+        "fantasy_town/roof-flat.glb#Scene0",
+    ];
+
+    let door_models = vec![
+        "fantasy_town/wall-door.glb#Scene0",
+        "fantasy_town/wall-wood-door.glb#Scene0",
+    ];
+
+    let decoration_models = vec![
+        "fantasy_town/fence.glb#Scene0",
+        "fantasy_town/hedge.glb#Scene0",
+        "fantasy_town/lantern.glb#Scene0",
+    ];
+
+    // Spawn buildings around plaza in circular arrangement
+    for i in 0..NUM_BUILDINGS {
+        let angle = (i as f32 / NUM_BUILDINGS as f32) * std::f32::consts::TAU;
+
+        // Position building at distance from plaza center
+        let building_x = VILLAGE_CENTER_X + angle.cos() * BUILDING_DISTANCE;
+        let building_z = VILLAGE_CENTER_Z + angle.sin() * BUILDING_DISTANCE;
+        let building_y = VILLAGE_CENTER_Y;
+
+        // Rotate building to face plaza (center)
+        let rotation = Quat::from_rotation_y(angle + std::f32::consts::PI);
+
+        // Build a simple house using wall + roof
+        // Main structure: wall + roof
+        commands.spawn((
+            VillageBuilding,
+            SceneRoot(asset_server.load("fantasy_town/wall.glb#Scene0")),
+            Transform {
+                translation: Vec3::new(building_x, building_y, building_z),
+                rotation,
+                scale: Vec3::splat(3.0),  // Scale up for visibility
+            },
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+        ));
+
+        // Add roof on top
+        commands.spawn((
+            VillageBuilding,
+            SceneRoot(asset_server.load("fantasy_town/roof-gable.glb#Scene0")),
+            Transform {
+                translation: Vec3::new(building_x, building_y + 3.0, building_z),
+                rotation,
+                scale: Vec3::splat(3.0),
+            },
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+        ));
+
+        // Add door
+        commands.spawn((
+            VillageBuilding,
+            SceneRoot(asset_server.load("fantasy_town/wall-door.glb#Scene0")),
+            Transform {
+                translation: Vec3::new(building_x, building_y, building_z),
+                rotation,
+                scale: Vec3::splat(2.5),
+            },
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+        ));
+    }
+
+    // Spawn decorative elements around village
+    for i in 0..NUM_BUILDINGS {
+        let angle = (i as f32 / NUM_BUILDINGS as f32) * std::f32::consts::TAU + (std::f32::consts::PI / NUM_BUILDINGS as f32);
+
+        // Fences between buildings
+        let fence_x = VILLAGE_CENTER_X + angle.cos() * (BUILDING_DISTANCE - 50.0);
+        let fence_z = VILLAGE_CENTER_Z + angle.sin() * (BUILDING_DISTANCE - 50.0);
+
+        commands.spawn((
+            VillageDecoration,
+            SceneRoot(asset_server.load("fantasy_town/fence.glb#Scene0")),
+            Transform {
+                translation: Vec3::new(fence_x, VILLAGE_CENTER_Y, fence_z),
+                rotation: Quat::from_rotation_y(angle),
+                scale: Vec3::splat(2.0),
+            },
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+        ));
+    }
+
+    // Spawn central plaza marker (green area) - use a simple plane
+    let plaza_radius = PLAZA_RADIUS;
+    commands.spawn((
+        VillageRoad,
+        Transform::from_xyz(VILLAGE_CENTER_X, VILLAGE_CENTER_Y - 0.1, VILLAGE_CENTER_Z),
+        GlobalTransform::default(),
+    ));
+
+    println!("🏘️  Village spawned - Angerdorf layout with {} buildings around central plaza", NUM_BUILDINGS);
 }
 
 /// NEW: Spawn random meteor obstacles in the sky
@@ -493,9 +736,144 @@ fn spawn_meteors(
     }
 }
 
+/// NEW: Spawn destructible mission objectives (Satellite Dishes)
+fn spawn_objectives(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+) {
+    let dish_handle = asset_server.load("models/satelliteDish_large.glb#Scene0");
+    
+    // Position 3 objectives in a triangle around the world
+    let positions = [
+        Vec3::new(500.0, 0.0, -500.0),
+        Vec3::new(-500.0, 0.0, -500.0),
+        Vec3::new(0.0, 0.0, 800.0),
+    ];
+
+    for (i, pos) in positions.iter().enumerate() {
+        commands.spawn((
+            Objective,
+            SceneRoot(dish_handle.clone()),
+            Transform {
+                translation: *pos,
+                rotation: Quat::from_rotation_y(i as f32 * 2.0),
+                scale: Vec3::splat(15.0), // Scale up to be a good target
+            },
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+            RigidBody::Static,
+            Collider::cuboid(5.0, 8.0, 5.0), // Match model approx
+        ));
+        
+        println!("📡 Objective {} spawned at {:?}", i + 1, pos);
+    }
+}
+
+/// NEW: Spawn enemy turrets
+fn spawn_turrets(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+) {
+    let turret_handle = asset_server.load("models/turret_double.glb#Scene0");
+    
+    // Position turrets near objectives
+    let positions = [
+        Vec3::new(450.0, 0.0, -450.0),
+        Vec3::new(-450.0, 0.0, -450.0),
+        Vec3::new(50.0, 0.0, 750.0),
+    ];
+
+    for pos in positions {
+        commands.spawn((
+            Turret {
+                fire_timer: Timer::from_seconds(2.0, TimerMode::Repeating),
+            },
+            SceneRoot(turret_handle.clone()),
+            Transform {
+                translation: pos,
+                rotation: Quat::IDENTITY,
+                scale: Vec3::splat(15.0),
+            },
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+            RigidBody::Static,
+            Collider::cuboid(4.0, 6.0, 4.0),
+        ));
+    }
+}
+
+/// NEW: Update turret AI: rotate and fire at player
+fn update_turrets(
+    time: Res<Time>,
+    player_query: Query<&Transform, With<PlayerPlane>>,
+    mut turret_query: Query<(&mut Transform, &mut Turret), Without<PlayerPlane>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if let Ok(player_transform) = player_query.get_single() {
+        for (mut transform, mut turret) in &mut turret_query {
+            // Face the player
+            let target_pos = player_transform.translation;
+            transform.look_at(target_pos, Vec3::Y);
+            
+            // Fire every 2 seconds
+            turret.fire_timer.tick(time.delta());
+            if turret.fire_timer.just_finished() {
+                let muzzle_pos = transform.translation + transform.up().as_vec3() * 5.0;
+                let direction = (target_pos - muzzle_pos).normalize();
+                let velocity = direction * 300.0; // Slower than player bullets
+                
+                spawn_missile(&mut commands, &mut meshes, &mut materials, muzzle_pos, transform.rotation, velocity);
+                spawn_muzzle_flash(&mut commands, muzzle_pos);
+            }
+        }
+    }
+}
+
+/// Dynamic engine and environmental audio system
+fn update_engine_audio(
+    player_query: Query<(&PlayerInput, &LinearVelocity, &Transform), With<PlayerPlane>>,
+    mut engine_audio_query: Query<&AudioSink, (With<EngineSound>, Without<WindSound>, Without<WarningSound>)>,
+    mut wind_audio_query: Query<&AudioSink, (With<WindSound>, Without<EngineSound>, Without<WarningSound>)>,
+    mut warning_audio_query: Query<&AudioSink, (With<WarningSound>, Without<EngineSound>, Without<WindSound>)>,
+) {
+    if let Ok((input, velocity, transform)) = player_query.get_single() {
+        let speed = velocity.0.length();
+        
+        // Engine Sound: Scales with throttle
+        for sink in &mut engine_audio_query {
+            sink.set_volume(0.1 + input.throttle * 0.7);
+            sink.set_speed(0.8 + input.throttle * 0.7);
+        }
+
+        // Wind/Airflow Sound: Scales with actual speed (max volume at 500 m/s)
+        let wind_volume = (speed / 500.0).min(1.0) * 0.5;
+        for sink in &mut wind_audio_query {
+            sink.set_volume(wind_volume);
+            sink.set_speed(0.9 + (speed / 500.0) * 0.3);
+        }
+
+        // Warning Alarm: Trigger if altitude is low and speed is high (Danger zone)
+        let altitude = transform.translation.y;
+        let danger = altitude < 100.0 && speed > 200.0;
+        for sink in &mut warning_audio_query {
+            if danger {
+                sink.play();
+                sink.set_volume(0.4);
+            } else {
+                sink.pause();
+            }
+        }
+    }
+}
+
 fn spawn_player(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    sounds: Res<SoundAssets>,
 ) {
     // Print controls on startup
     println!("\n╔══════════════════════════════════════════════╗");
@@ -534,6 +912,7 @@ fn spawn_player(
     ))
     .insert(FlightControlComputer::default())
     .insert(DiagnosticTimer(Timer::from_seconds(0.5, TimerMode::Repeating)))
+    .insert(AfterburnerParticles::default())
     .insert(LastShotTime::default())
     .id();
 
@@ -549,6 +928,40 @@ fn spawn_player(
             Visibility::default(),
             InheritedVisibility::default(),
             SceneRoot(model_handle),
+        ));
+
+        // Looping engine sound
+        parent.spawn((
+            EngineSound,
+            AudioPlayer(sounds.engine_loop.clone()),
+            PlaybackSettings {
+                mode: bevy::audio::PlaybackMode::Loop,
+                volume: bevy::audio::Volume::new(0.2), // Start quiet
+                ..default()
+            },
+        ));
+
+        // Wind/Airflow loop
+        parent.spawn((
+            WindSound,
+            AudioPlayer(sounds.wind.clone()),
+            PlaybackSettings {
+                mode: bevy::audio::PlaybackMode::Loop,
+                volume: bevy::audio::Volume::new(0.0), // Starts silent
+                ..default()
+            },
+        ));
+
+        // Warning alarm loop
+        parent.spawn((
+            WarningSound,
+            AudioPlayer(sounds.warning.clone()),
+            PlaybackSettings {
+                mode: bevy::audio::PlaybackMode::Loop,
+                volume: bevy::audio::Volume::new(0.0), // Starts silent
+                paused: true, // Only plays in danger
+                ..default()
+            },
         ));
     });
 }
@@ -1239,6 +1652,7 @@ fn handle_shooting_input(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    sounds: Res<SoundAssets>,
 ) {
     if let Ok((player_transform, mut last_shot)) = player_query.get_single_mut() {
         let current_time = time.elapsed_secs();
@@ -1254,6 +1668,17 @@ fn handle_shooting_input(
             spawn_missile(&mut commands, &mut meshes, &mut materials, gun_position_world, player_transform.rotation, bullet_velocity);
             
             spawn_muzzle_flash(&mut commands, gun_position_world);
+
+            // Play missile launch sound
+            commands.spawn((
+                AudioPlayer(sounds.missile_launch.clone()),
+                PlaybackSettings {
+                    mode: bevy::audio::PlaybackMode::Despawn,
+                    volume: bevy::audio::Volume::new(0.5),
+                    ..default()
+                },
+            ));
+
             last_shot.time = current_time;
         }
     }
@@ -1275,8 +1700,12 @@ fn update_projectiles(
 fn handle_projectile_collisions(
     mut collision_events: EventReader<Collision>,
     projectile_query: Query<Entity, With<Projectile>>,
-    ground_query: Query<Entity, (With<Collider>, Without<Projectile>, Without<PlayerPlane>)>,
+    ground_query: Query<Entity, (With<Collider>, Without<Projectile>, Without<PlayerPlane>, Without<Objective>)>,
+    objective_query: Query<(Entity, &Transform), With<Objective>>,
     mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    sounds: Res<SoundAssets>,
 ) {
     for Collision(contacts) in collision_events.read() {
         let projectile_entity = if projectile_query.contains(contacts.entity1) {
@@ -1296,6 +1725,24 @@ fn handle_projectile_collisions(
             
             if ground_query.contains(other_entity) {
                 commands.entity(bullet).despawn_recursive();
+            } else if let Ok((target_entity, target_transform)) = objective_query.get(other_entity) {
+                println!("🎯 TARGET DESTROYED!");
+                
+                let explosion_pos = target_transform.translation;
+                commands.entity(target_entity).despawn_recursive();
+                commands.entity(bullet).despawn_recursive();
+                
+                spawn_huge_explosion(&mut commands, &mut meshes, &mut materials, explosion_pos);
+
+                // Play explosion sound
+                commands.spawn((
+                    AudioPlayer(sounds.explosion.clone()),
+                    PlaybackSettings {
+                        mode: bevy::audio::PlaybackMode::Despawn,
+                        volume: bevy::audio::Volume::new(1.0),
+                        ..default()
+                    },
+                ));
             }
         }
     }
@@ -1442,30 +1889,54 @@ struct ExplosionEffect {
     max_lifetime: f32,
 }
 
-/// Check for ground collision and create explosion effect
+/// Check for ground collision and create explosion effect.
+/// Resets rotation and angular velocity on respawn to avoid physics AABB panic (invalid bounds).
 fn check_ground_collision(
     mut commands: Commands,
-    mut player_query: Query<(Entity, &mut Transform, &mut LinearVelocity), With<PlayerPlane>>,
+    mut player_query: Query<(
+        Entity,
+        &mut Transform,
+        &mut LinearVelocity,
+        &mut AngularVelocity,
+    ), With<PlayerPlane>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    sounds: Res<SoundAssets>,
 ) {
     const GROUND_LEVEL: f32 = 0.0;
+    const SOFT_CEILING: f32 = 0.5; // Don't let physics see us below this (avoids AABB edge cases)
 
-    for (_entity, mut transform, mut velocity) in &mut player_query {
+    for (_entity, mut transform, mut velocity, mut ang_vel) in &mut player_query {
         if transform.translation.y <= GROUND_LEVEL {
             let crash_speed = velocity.length();
 
             if crash_speed > 50.0 {
                 println!("💥 MASSIVE EXPLOSION! Speed: {:.0} m/s", crash_speed);
                 spawn_huge_explosion(&mut commands, &mut meshes, &mut materials, transform.translation);
-                
-                // Reset plane
+
+                // Play crash sound
+                commands.spawn((
+                    AudioPlayer(sounds.crash.clone()),
+                    PlaybackSettings {
+                        mode: bevy::audio::PlaybackMode::Despawn,
+                        volume: bevy::audio::Volume::new(1.0),
+                        ..default()
+                    },
+                ));
+
+                // Full reset so physics never sees invalid rotation (avoids AABB panic)
                 transform.translation = Vec3::new(0.0, 500.0, 0.0);
+                transform.rotation = Quat::IDENTITY;
                 *velocity = LinearVelocity(Vec3::new(0.0, 0.0, -200.0));
+                *ang_vel = AngularVelocity::default();
             } else {
-                transform.translation.y = GROUND_LEVEL + 1.0;
-                velocity.y = velocity.y.max(0.0);
+                // Soft landing: keep above ground and zero downward velocity
+                transform.translation.y = GROUND_LEVEL + SOFT_CEILING;
+                velocity.0.y = velocity.0.y.max(0.0);
             }
+        } else if transform.translation.y < GROUND_LEVEL + SOFT_CEILING {
+            // Clamp just above ground so we never penetrate (helps collision/physics stability)
+            transform.translation.y = GROUND_LEVEL + SOFT_CEILING;
         }
     }
 }
@@ -1564,41 +2035,69 @@ fn spawn_afterburner_particles(
     player_query: Query<(&Transform, &PlayerInput), With<PlayerPlane>>,
     emitter_query: Query<&AfterburnerParticles, With<PlayerPlane>>,
 ) {
-    if let (Ok((player_transform, input)), Ok(emitter)) = (player_query.get_single(), emitter_query.get_single()) {
-        if input.throttle < emitter.spawn_threshold {
-            return;
-        }
+    // #region agent log
+    let (player_ok, emitter_ok) = (player_query.get_single(), emitter_query.get_single());
+    if player_ok.is_err() || emitter_ok.is_err() {
+        debug_log("spawn_afterburner_particles", "query get_single failed", &format!(r#"{{"player_ok":{},"emitter_ok":{}}}"#, player_ok.is_ok(), emitter_ok.is_ok()), "D");
+        return;
+    }
+    let (player_transform, input) = player_ok.unwrap();
+    let emitter = emitter_ok.unwrap();
+    // #endregion
+    if input.throttle < emitter.spawn_threshold {
+        // #region agent log
+        debug_log("spawn_afterburner_particles", "throttle below threshold", &format!(r#"{{"throttle":{},"spawn_threshold":{}}}"#, input.throttle, emitter.spawn_threshold), "A");
+        // #endregion
+        return;
+    }
 
-        let throttle_factor = (input.throttle - emitter.spawn_threshold) / (1.0 - emitter.spawn_threshold);
-        let actual_spawn_rate = emitter.spawn_rate * throttle_factor;
+    let throttle_factor = (input.throttle - emitter.spawn_threshold) / (1.0 - emitter.spawn_threshold);
+    let actual_spawn_rate = emitter.spawn_rate * throttle_factor;
+    let spawn_count = actual_spawn_rate as u32;
+    // #region agent log
+    debug_log("spawn_afterburner_particles", "spawn rate computed", &format!(r#"{{"throttle":{},"throttle_factor":{},"actual_spawn_rate":{},"spawn_count_u32":{}}}"#, input.throttle, throttle_factor, actual_spawn_rate, spawn_count), "A");
+    // #endregion
 
-        for _ in 0..(actual_spawn_rate as u32) {
-            let model_space_pos = Vec3::new(0.0, -0.2, 3.5);
-            let world_pos: Vec3 = player_transform.transform_point(model_space_pos);
+    // Exhaust always behind plane in world space (avoids flame appearing at wing when banked)
+    let back = (-player_transform.forward().as_vec3()).normalize_or_zero();
+    const EXHAUST_DISTANCE: f32 = 2.8; // Further back so flame is outside exhaust, not inside fuselage
+    const EXHAUST_SHIFT_LEFT: f32 = 2.6; // Nudge left so flame is at center exhaust
+    let world_pos: Vec3 = player_transform.translation
+        + back * EXHAUST_DISTANCE
+        - player_transform.right().as_vec3() * EXHAUST_SHIFT_LEFT;
+    // #region agent log
+    if spawn_count > 0 {
+        debug_log("spawn_afterburner_particles", "spawn world_pos", &format!(r#"{{"world_pos":[{},{},{}],"player_translation":[{},{},{}],"back":[{},{},{}]}}"#, world_pos.x, world_pos.y, world_pos.z, player_transform.translation.x, player_transform.translation.y, player_transform.translation.z, back.x, back.y, back.z), "B");
+    }
+    // #endregion
+
+    for _ in 0..spawn_count {
 
             let backward_velocity = player_transform.forward().as_vec3() * -20.0;
             let random_spread = Vec3::new(
                 (rand::random::<f32>() - 0.5) * 5.0,
-                (rand::random::<f32>() - 0.5) * 5.0 + 3.0,
+                (rand::random::<f32>() - 0.5) * 5.0,
                 (rand::random::<f32>() - 0.5) * 5.0,
             );
             let velocity = backward_velocity + random_spread;
 
-            let flame_index = ((time.elapsed_secs() * 5.0) as usize) % 3 + 1;
+            let flame_index = ((time.elapsed_secs() * 10.0) as usize) % 6 + 1;
             let texture_path = format!("particles/flame_0{}.png", flame_index);
             let texture_handle = asset_server.load(&texture_path);
 
             let material = StandardMaterial {
                 base_color_texture: Some(texture_handle),
-                base_color: Color::srgba(1.0, 1.0, 1.0, 0.9),
-                emissive: LinearRgba::rgb(2.0, 1.5, 0.5),
+                base_color: Color::srgba(1.0, 0.35, 0.05, 0.95), // Red-orange flame
+                emissive: LinearRgba::rgb(8.0, 2.5, 0.2),      // Bright orange flame glow
                 alpha_mode: AlphaMode::Blend,
                 unlit: true,
+                double_sided: true, // Visible from both sides
+                cull_mode: None,
                 ..default()
             };
 
             let material_handle = materials.add(material);
-            let size = 0.5 + throttle_factor * 0.8;
+            let size = 0.8 + throttle_factor * 1.5; // Larger particles
             let quad_mesh = meshes.add(Mesh::from(Rectangle::new(size, size)));
 
             commands.spawn((
@@ -1607,8 +2106,7 @@ fn spawn_afterburner_particles(
                     lifetime_max: emitter.particle_lifetime,
                     velocity,
                 },
-                Transform::from_translation(world_pos)
-                    .with_rotation(Quat::from_rotation_y(rand::random::<f32>() * std::f32::consts::TAU)),
+                Transform::from_translation(world_pos),
                 GlobalTransform::default(),
                 Visibility::default(),
                 InheritedVisibility::default(),
@@ -1616,7 +2114,6 @@ fn spawn_afterburner_particles(
                 Mesh3d(quad_mesh),
             ));
         }
-    }
 }
 
 /// Update particles: movement, fade, despawn
@@ -1625,8 +2122,30 @@ fn update_particles(
     time: Res<Time>,
     mut particle_query: Query<(Entity, &mut Transform, &mut Particle, &mut MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    camera_query: Query<&Transform, (With<Camera3d>, Without<Particle>)>,
+    mut log_acc: Local<f32>,
 ) {
+    let camera_transform = camera_query.get_single().ok();
+
+    // #region agent log
+    *log_acc += time.delta_secs();
+    let should_log = *log_acc >= 1.0;
+    if should_log {
+        *log_acc = 0.0;
+    }
+    let mut log_count: u32 = 0;
+    let mut log_first_pos = Vec3::ZERO;
+    let mut log_first_life = -1.0_f32;
+    // #endregion
+
     for (entity, mut transform, mut particle, material_handle) in &mut particle_query {
+        // #region agent log
+        log_count += 1;
+        if log_count == 1 {
+            log_first_pos = transform.translation;
+            log_first_life = particle.lifetime_remaining;
+        }
+        // #endregion
         particle.lifetime_remaining -= time.delta_secs();
 
         if particle.lifetime_remaining <= 0.0 {
@@ -1637,11 +2156,20 @@ fn update_particles(
         let drift = Vec3::Y * 5.0 * time.delta_secs();
         transform.translation += particle.velocity * time.delta_secs() + drift;
 
+        // Face the camera (billboarding)
+        if let Some(cam_transform) = camera_transform {
+            transform.look_at(cam_transform.translation, Vec3::Y);
+        }
+
         let opacity = particle.lifetime_remaining / particle.lifetime_max;
         if let Some(material) = materials.get_mut(&material_handle.0) {
             material.base_color.set_alpha(opacity);
         }
-
-        transform.rotate_y(2.0 * time.delta_secs());
     }
+
+    // #region agent log
+    if should_log {
+        debug_log("update_particles", "particle count and first", &format!(r#"{{"particle_count":{},"first_pos":[{},{},{}],"first_lifetime_remaining":{}}}"#, log_count, log_first_pos.x, log_first_pos.y, log_first_pos.z, log_first_life), "E");
+    }
+    // #endregion
 }
