@@ -6,33 +6,6 @@ use rand::prelude::*;
 // COMPONENTS - Data containers for game entities
 // ============================================================================
 
-/// Afterburner flame effect component
-#[derive(Component)]
-struct AfterburnerFlame;
-
-/// Marker component for meteors
-#[derive(Component)]
-struct Meteor;
-
-/// Marker component to identify the player plane parent
-#[derive(Component)]
-struct PlayerPlane;
-
-/// Marker for the container that holds the visual model
-/// Allowing us to rotate the model (e.g. for banking) without affecting physics
-#[derive(Component)]
-struct ModelContainer;
-
-/// Stores current player input state
-#[derive(Component)]
-struct PlayerInput {
-    pitch: f32,
-    roll: f32,
-    yaw: f32,      // Added Yaw (Rudder)
-    throttle: f32,
-    _brake: f32,    // Airbrake
-}
-
 /// Afterburner particle emitter component
 #[derive(Component)]
 struct AfterburnerParticles {
@@ -57,6 +30,29 @@ struct Particle {
     lifetime_remaining: f32,
     lifetime_max: f32,
     velocity: Vec3,
+}
+
+/// Marker component for meteors
+#[derive(Component)]
+struct Meteor;
+
+/// Marker component to identify the player plane parent
+#[derive(Component)]
+struct PlayerPlane;
+
+/// Marker for the container that holds the visual model
+/// Allowing us to rotate the model (e.g. for banking) without affecting physics
+#[derive(Component)]
+struct ModelContainer;
+
+/// Stores current player input state
+#[derive(Component)]
+struct PlayerInput {
+    pitch: f32,
+    roll: f32,
+    yaw: f32,      // Added Yaw (Rudder)
+    throttle: f32,
+    _brake: f32,    // Airbrake
 }
 
 /// Timer for debug diagnostics
@@ -519,8 +515,6 @@ fn spawn_meteors(
 fn spawn_player(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     // Print controls on startup
     println!("\n╔══════════════════════════════════════════════╗");
@@ -560,7 +554,6 @@ fn spawn_player(
     .insert(FlightControlComputer::default())
     .insert(DiagnosticTimer(Timer::from_seconds(0.5, TimerMode::Repeating)))
     .insert(LastShotTime::default())
-    .insert(AfterburnerParticles::default())
     .id();
 
     commands.entity(player)
