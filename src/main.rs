@@ -6,6 +6,10 @@ use rand::prelude::*;
 // COMPONENTS - Data containers for game entities
 // ============================================================================
 
+/// Afterburner flame effect component
+#[derive(Component)]
+struct AfterburnerFlame;
+
 /// Marker component for meteors
 #[derive(Component)]
 struct Meteor;
@@ -333,7 +337,8 @@ fn main() {
             read_player_input,
             arcade_flight_physics, // ARCADE PHYSICS: Direct control, no FBW interference
             debug_flight_diagnostics, // New diagnostics system
-            update_afterburner_flame, // Flame visual effect based on throttle
+            spawn_afterburner_particles, // Particle spawning based on throttle
+            update_particles, // Update particle positions and fade
             check_ground_collision, // Ground collision + explosions
             update_flight_camera,
             debug_flight_data,
@@ -561,6 +566,7 @@ fn spawn_player(
     .insert(FlightControlComputer::default())
     .insert(DiagnosticTimer(Timer::from_seconds(0.5, TimerMode::Repeating)))
     .insert(LastShotTime::default())
+    .insert(AfterburnerParticles::default())
     .id();
 
     commands.entity(player)
@@ -575,41 +581,6 @@ fn spawn_player(
             Visibility::default(),
             InheritedVisibility::default(),
             SceneRoot(model_handle),
-        ));
-
-        // Afterburner flame - two perpendicular planes from the rear exhaust
-        // This creates a "cross" visible from all angles
-        let flame_mesh = meshes.add(Rectangle::new(0.4, 0.6));  // Small rectangle
-        let flame_material = materials.add(StandardMaterial {
-            base_color: Color::srgba(1.0, 0.5, 0.0, 0.5),  // Orange, semi-transparent
-            emissive: LinearRgba::rgb(4.0, 1.5, 0.0),      // Bright orange glow
-            unlit: true,                                    // Self-lit (no shadow needed)
-            double_sided: true,                             // Visible from both sides
-            ..default()
-        });
-
-        // First plane (vertical) at rear exhaust
-        parent.spawn((
-            AfterburnerFlame,
-            Mesh3d(flame_mesh.clone()),
-            MeshMaterial3d(flame_material.clone()),
-            Transform::from_xyz(0.0, 0.0, 3.0)  // At rear exhaust (Z+)
-                .with_scale(Vec3::splat(0.1)),   // Scale in model space
-            GlobalTransform::default(),
-            Visibility::default(),
-            InheritedVisibility::default(),
-        ));
-
-        // Second plane (horizontal) perpendicular to first
-        parent.spawn((
-            Mesh3d(flame_mesh),
-            MeshMaterial3d(flame_material),
-            Transform::from_xyz(0.0, 0.0, 3.0)  // Same rear position
-                .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
-                .with_scale(Vec3::splat(0.1)),
-            GlobalTransform::default(),
-            Visibility::default(),
-            InheritedVisibility::default(),
         ));
     });
 }
@@ -1038,43 +1009,110 @@ fn arcade_flight_physics(
     }
 }
 
-fn update_afterburner_flame(
-    player_query: Query<&PlayerInput, With<PlayerPlane>>,
-    mut flame_query: Query<(&mut Transform, &mut MeshMaterial3d<StandardMaterial>), With<AfterburnerFlame>>,
+/// Spawn particle effects from jet exhaust based on throttle
+fn spawn_afterburner_particles(
+    mut commands: Commands,
+    time: Res<Time>,
+    asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    player_query: Query<(&Transform, &PlayerInput), With<PlayerPlane>>,
+    emitter_query: Query<&AfterburnerParticles, With<PlayerPlane>>,
+) {
+    if let (Ok((player_transform, input)), Ok(emitter)) = (player_query.get_single(), emitter_query.get_single()) {
+        // Only spawn if throttle is above threshold
+        if input.throttle < emitter.spawn_threshold {
+            return;
+        }
+
+        // Calculate spawn rate based on throttle
+        let throttle_factor = (input.throttle - emitter.spawn_threshold) / (1.0 - emitter.spawn_threshold);
+        let actual_spawn_rate = emitter.spawn_rate * throttle_factor;
+
+        // Spawn particles this frame
+        for _ in 0..(actual_spawn_rate as u32) {
+            // Position: rear of plane in model space (Z = 3.5)
+            let model_space_pos = Vec3::new(0.0, -0.2, 3.5);
+            let world_pos = player_transform.transform_point(model_space_pos);
+
+            // Velocity: backward + some randomness
+            let backward_velocity = player_transform.forward().as_vec3() * -20.0;
+            let random_spread = Vec3::new(
+                (rand::random::<f32>() - 0.5) * 5.0,
+                (rand::random::<f32>() - 0.5) * 5.0 + 3.0,
+                (rand::random::<f32>() - 0.5) * 5.0,
+            );
+            let velocity = backward_velocity + random_spread;
+
+            // Cycle through flame textures
+            let flame_index = ((time.elapsed_secs() * 5.0) as usize) % 3 + 1;
+            let texture_path = format!("particles/flame_0{}.png", flame_index);
+            let texture_handle = asset_server.load(&texture_path);
+
+            // Create material with flame texture
+            let material = StandardMaterial {
+                base_color_texture: Some(texture_handle),
+                base_color: Color::srgba(1.0, 1.0, 1.0, 0.9),
+                emissive: Color::srgb(2.0, 1.5, 0.5),
+                alpha_mode: AlphaMode::Blend,
+                unlit: true,
+                ..default()
+            };
+
+            let material_handle = materials.add(material);
+
+            // Size scales with throttle
+            let size = 0.5 + throttle_factor * 0.8;
+            let quad_mesh = meshes.add(Mesh::from(Rectangle::new(size, size)));
+
+            // Spawn particle
+            commands.spawn((
+                Particle {
+                    lifetime_remaining: emitter.particle_lifetime,
+                    lifetime_max: emitter.particle_lifetime,
+                    velocity,
+                },
+                Transform::from_translation(world_pos)
+                    .with_rotation(Quat::from_rotation_y(rand::random::<f32>() * std::f32::consts::TAU)),
+                GlobalTransform::default(),
+                Visibility::default(),
+                InheritedVisibility::default(),
+                MeshMaterial3d(material_handle),
+                Mesh3d(quad_mesh),
+            ));
+        }
+    }
+}
+
+/// Update particles: movement, fade, despawn
+fn update_particles(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut particle_query: Query<(Entity, &mut Transform, &mut Particle, &mut MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    if let Ok(input) = player_query.get_single() {
-        for (mut transform, material_handle) in &mut flame_query {
-            // Scale flame based on throttle (0.3 to 3.0 scale)
-            let scale = 0.3 + input.throttle * 2.7;
-            transform.scale = Vec3::splat(scale);
+    for (entity, mut transform, mut particle, material_handle) in &mut particle_query {
+        // Update lifetime
+        particle.lifetime_remaining -= time.delta_secs();
 
-            // Update flame color and emission
-            if let Some(material) = materials.get_mut(&material_handle.0) {
-                if input.throttle > 0.1 {
-                    // Bright orange at boost, dimmer at low throttle
-                    let emission_intensity = input.throttle * 5.0;
-                    material.emissive = LinearRgba::rgb(
-                        emission_intensity,                    // Red
-                        emission_intensity * 0.4,              // Green (makes orange)
-                        0.0                                    // Blue
-                    );
-
-                    // At boost threshold (80%), add white tint
-                    if input.throttle > 0.8 {
-                        let boost_intensity = (input.throttle - 0.8) * 5.0;
-                        material.emissive = LinearRgba::rgb(
-                            emission_intensity + boost_intensity * 2.0,
-                            emission_intensity * 0.4 + boost_intensity,
-                            boost_intensity * 0.5
-                        );
-                    }
-                } else {
-                    // Dim at idle
-                    material.emissive = LinearRgba::rgb(1.0, 0.3, 0.0);
-                }
-            }
+        // Despawn if dead
+        if particle.lifetime_remaining <= 0.0 {
+            commands.entity(entity).despawn();
+            continue;
         }
+
+        // Update position: velocity + upward drift
+        let drift = Vec3::Y * 5.0 * time.delta_secs();
+        transform.translation += particle.velocity * time.delta_secs() + drift;
+
+        // Fade out over lifetime
+        let opacity = particle.lifetime_remaining / particle.lifetime_max;
+        if let Some(material) = materials.get_mut(&material_handle.0) {
+            material.base_color.set_alpha(opacity);
+        }
+
+        // Rotation for visual interest
+        transform.rotate_y(2.0 * time.delta_secs());
     }
 }
 
