@@ -6,30 +6,12 @@ use rand::prelude::*;
 // COMPONENTS - Data containers for game entities
 // ============================================================================
 
-/// Afterburner particle emitter component
+/// Afterburner flame effect component
 #[derive(Component)]
-struct AfterburnerParticles {
-    spawn_rate: f32,
-    spawn_threshold: f32,
-    particle_lifetime: f32,
-}
-
-impl Default for AfterburnerParticles {
-    fn default() -> Self {
-        Self {
-            spawn_rate: 5.0,
-            spawn_threshold: 0.2,
-            particle_lifetime: 0.8,
-        }
-    }
-}
-
-/// Individual particle component
-#[derive(Component)]
-struct Particle {
-    lifetime_remaining: f32,
-    lifetime_max: f32,
-    velocity: Vec3,
+struct AfterburnerFlame {
+    flame_textures: Vec<Handle<Image>>,
+    timer: Timer,
+    current_frame: usize,
 }
 
 /// Marker component for meteors
@@ -995,58 +977,6 @@ fn arcade_flight_physics(
     }
 }
 
-/// SYSTEM: Update and animate afterburner flame
-fn update_afterburner_flame(
-    time: Res<Time>,
-    player_query: Query<&PlayerInput, With<PlayerPlane>>,
-    mut flame_query: Query<(&mut Transform, &MeshMaterial3d<StandardMaterial>, Option<&mut AfterburnerFlame>)>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    if let Ok(input) = player_query.get_single() {
-        // Find main flame component to update shared textures
-        let mut current_frame_texture = None;
-        for (_, _, opt_flame) in &mut flame_query {
-            if let Some(mut flame) = opt_flame {
-                flame.timer.tick(time.delta());
-                if flame.timer.just_finished() {
-                    flame.current_frame = (flame.current_frame + 1) % flame.flame_textures.len();
-                }
-                current_frame_texture = Some(flame.flame_textures[flame.current_frame].clone());
-                break;
-            }
-        }
-
-        for (mut transform, material_handle, _) in &mut flame_query {
-            // 1. Update texture if it changed
-            if let (Some(texture), Some(material)) = (&current_frame_texture, materials.get_mut(&material_handle.0)) {
-                material.base_color_texture = Some(texture.clone());
-            }
-
-            // 2. Scale flame based on throttle
-            let length = 0.2 + input.throttle * 5.0;
-            let width = 0.1 + input.throttle * 1.2;
-            transform.scale = Vec3::new(width, length, 1.0);
-            
-            // Re-center so it grows from the nozzle
-            transform.translation.z = 3.0 + (length / 2.0);
-
-            // 3. Color and Opacity
-            if let Some(material) = materials.get_mut(&material_handle.0) {
-                if input.throttle > 0.05 {
-                    material.base_color = Color::srgba(
-                        1.0, 
-                        0.5 + input.throttle * 0.5, 
-                        0.3 + input.throttle * 0.7, 
-                        (0.4 + input.throttle * 0.6).min(1.0)
-                    );
-                } else {
-                    material.base_color = Color::srgba(0.8, 0.4, 0.2, 0.1);
-                }
-            }
-        }
-    }
-}
-
 fn update_flight_camera(
     time: Res<Time>,
     mut camera_query: Query<&mut Transform, (With<Camera3d>, Without<PlayerPlane>)>,
@@ -1621,5 +1551,97 @@ fn update_explosion_effects(
         if effect.lifetime >= effect.max_lifetime {
             commands.entity(entity).despawn_recursive();
         }
+    }
+}
+
+/// Spawn particle effects from jet exhaust based on throttle
+fn spawn_afterburner_particles(
+    mut commands: Commands,
+    time: Res<Time>,
+    asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    player_query: Query<(&Transform, &PlayerInput), With<PlayerPlane>>,
+    emitter_query: Query<&AfterburnerParticles, With<PlayerPlane>>,
+) {
+    if let (Ok((player_transform, input)), Ok(emitter)) = (player_query.get_single(), emitter_query.get_single()) {
+        if input.throttle < emitter.spawn_threshold {
+            return;
+        }
+
+        let throttle_factor = (input.throttle - emitter.spawn_threshold) / (1.0 - emitter.spawn_threshold);
+        let actual_spawn_rate = emitter.spawn_rate * throttle_factor;
+
+        for _ in 0..(actual_spawn_rate as u32) {
+            let model_space_pos = Vec3::new(0.0, -0.2, 3.5);
+            let world_pos: Vec3 = player_transform.transform_point(model_space_pos);
+
+            let backward_velocity = player_transform.forward().as_vec3() * -20.0;
+            let random_spread = Vec3::new(
+                (rand::random::<f32>() - 0.5) * 5.0,
+                (rand::random::<f32>() - 0.5) * 5.0 + 3.0,
+                (rand::random::<f32>() - 0.5) * 5.0,
+            );
+            let velocity = backward_velocity + random_spread;
+
+            let flame_index = ((time.elapsed_secs() * 5.0) as usize) % 3 + 1;
+            let texture_path = format!("particles/flame_0{}.png", flame_index);
+            let texture_handle = asset_server.load(&texture_path);
+
+            let material = StandardMaterial {
+                base_color_texture: Some(texture_handle),
+                base_color: Color::srgba(1.0, 1.0, 1.0, 0.9),
+                emissive: LinearRgba::rgb(2.0, 1.5, 0.5),
+                alpha_mode: AlphaMode::Blend,
+                unlit: true,
+                ..default()
+            };
+
+            let material_handle = materials.add(material);
+            let size = 0.5 + throttle_factor * 0.8;
+            let quad_mesh = meshes.add(Mesh::from(Rectangle::new(size, size)));
+
+            commands.spawn((
+                Particle {
+                    lifetime_remaining: emitter.particle_lifetime,
+                    lifetime_max: emitter.particle_lifetime,
+                    velocity,
+                },
+                Transform::from_translation(world_pos)
+                    .with_rotation(Quat::from_rotation_y(rand::random::<f32>() * std::f32::consts::TAU)),
+                GlobalTransform::default(),
+                Visibility::default(),
+                InheritedVisibility::default(),
+                MeshMaterial3d(material_handle),
+                Mesh3d(quad_mesh),
+            ));
+        }
+    }
+}
+
+/// Update particles: movement, fade, despawn
+fn update_particles(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut particle_query: Query<(Entity, &mut Transform, &mut Particle, &mut MeshMaterial3d<StandardMaterial>)>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    for (entity, mut transform, mut particle, material_handle) in &mut particle_query {
+        particle.lifetime_remaining -= time.delta_secs();
+
+        if particle.lifetime_remaining <= 0.0 {
+            commands.entity(entity).despawn();
+            continue;
+        }
+
+        let drift = Vec3::Y * 5.0 * time.delta_secs();
+        transform.translation += particle.velocity * time.delta_secs() + drift;
+
+        let opacity = particle.lifetime_remaining / particle.lifetime_max;
+        if let Some(material) = materials.get_mut(&material_handle.0) {
+            material.base_color.set_alpha(opacity);
+        }
+
+        transform.rotate_y(2.0 * time.delta_secs());
     }
 }
