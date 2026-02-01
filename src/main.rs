@@ -14,12 +14,6 @@ struct AfterburnerFlame;
 #[derive(Component)]
 struct Meteor;
 
-/// Resource to store meteor models
-#[derive(Resource)]
-struct MeteorAssets {
-    models: Vec<Handle<Gltf>>,
-}
-
 /// Marker component to identify the player plane parent
 #[derive(Component)]
 struct PlayerPlane;
