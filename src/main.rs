@@ -327,8 +327,7 @@ fn main() {
             read_player_input,
             arcade_flight_physics, // ARCADE PHYSICS: Direct control, no FBW interference
             debug_flight_diagnostics, // New diagnostics system
-            spawn_afterburner_particles, // Particle spawning based on throttle
-            update_particles, // Update particle positions and fade
+            update_afterburner_flame, // Flame visual effect based on throttle
             check_ground_collision, // Ground collision + explosions
             update_flight_camera,
             debug_flight_data,
@@ -993,6 +992,58 @@ fn arcade_flight_physics(
 
         // ===== 4. GRAVITY =====
         // Handled by Avian3D - no manual application needed
+    }
+}
+
+/// SYSTEM: Update and animate afterburner flame
+fn update_afterburner_flame(
+    time: Res<Time>,
+    player_query: Query<&PlayerInput, With<PlayerPlane>>,
+    mut flame_query: Query<(&mut Transform, &MeshMaterial3d<StandardMaterial>, Option<&mut AfterburnerFlame>)>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if let Ok(input) = player_query.get_single() {
+        // Find main flame component to update shared textures
+        let mut current_frame_texture = None;
+        for (_, _, opt_flame) in &mut flame_query {
+            if let Some(mut flame) = opt_flame {
+                flame.timer.tick(time.delta());
+                if flame.timer.just_finished() {
+                    flame.current_frame = (flame.current_frame + 1) % flame.flame_textures.len();
+                }
+                current_frame_texture = Some(flame.flame_textures[flame.current_frame].clone());
+                break;
+            }
+        }
+
+        for (mut transform, material_handle, _) in &mut flame_query {
+            // 1. Update texture if it changed
+            if let (Some(texture), Some(material)) = (&current_frame_texture, materials.get_mut(&material_handle.0)) {
+                material.base_color_texture = Some(texture.clone());
+            }
+
+            // 2. Scale flame based on throttle
+            let length = 0.2 + input.throttle * 5.0;
+            let width = 0.1 + input.throttle * 1.2;
+            transform.scale = Vec3::new(width, length, 1.0);
+            
+            // Re-center so it grows from the nozzle
+            transform.translation.z = 3.0 + (length / 2.0);
+
+            // 3. Color and Opacity
+            if let Some(material) = materials.get_mut(&material_handle.0) {
+                if input.throttle > 0.05 {
+                    material.base_color = Color::srgba(
+                        1.0, 
+                        0.5 + input.throttle * 0.5, 
+                        0.3 + input.throttle * 0.7, 
+                        (0.4 + input.throttle * 0.6).min(1.0)
+                    );
+                } else {
+                    material.base_color = Color::srgba(0.8, 0.4, 0.2, 0.1);
+                }
+            }
+        }
     }
 }
 
