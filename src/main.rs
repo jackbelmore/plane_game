@@ -1,9 +1,20 @@
 use bevy::prelude::*;
 use avian3d::prelude::*;
+use rand::prelude::*;
 
 // ============================================================================
 // COMPONENTS - Data containers for game entities
 // ============================================================================
+
+/// Marker component for meteors
+#[derive(Component)]
+struct Meteor;
+
+/// Resource to store meteor models
+#[derive(Resource)]
+struct MeteorAssets {
+    models: Vec<Handle<Gltf>>,
+}
 
 /// Marker component to identify the player plane parent
 #[derive(Component)]
@@ -24,9 +35,31 @@ struct PlayerInput {
     _brake: f32,    // Airbrake
 }
 
-/// Afterburner flame effect component
+/// Afterburner particle emitter component
 #[derive(Component)]
-struct AfterburnerFlame;
+struct AfterburnerParticles {
+    spawn_rate: f32,
+    spawn_threshold: f32,
+    particle_lifetime: f32,
+}
+
+impl Default for AfterburnerParticles {
+    fn default() -> Self {
+        Self {
+            spawn_rate: 5.0,
+            spawn_threshold: 0.2,
+            particle_lifetime: 0.8,
+        }
+    }
+}
+
+/// Individual particle component
+#[derive(Component)]
+struct Particle {
+    lifetime_remaining: f32,
+    lifetime_max: f32,
+    velocity: Vec3,
+}
 
 /// Timer for debug diagnostics
 #[derive(Component)]
@@ -291,9 +324,10 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(PhysicsPlugins::default())
-        .insert_resource(ClearColor(Color::srgb(0.5, 0.8, 1.0)))
+        .insert_resource(ClearColor(Color::srgb(0.05, 0.05, 0.1))) // Darker space color
         .init_resource::<F16AeroData>() // Load Aero Data
         .add_systems(Startup, setup_scene)
+        .add_systems(Startup, spawn_meteors) // NEW: Spawn obstacles
         .add_systems(Startup, spawn_player)
         .add_systems(Update, (
             read_player_input,
@@ -407,6 +441,80 @@ fn setup_scene(
         Transform::from_xyz(0.0, 50.0, 15.0).looking_at(Vec3::ZERO, Vec3::Y),
         GlobalTransform::default(),
     ));
+}
+
+/// NEW: Spawn random meteor obstacles in the sky
+fn spawn_meteors(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+) {
+    let mut rng = rand::thread_rng();
+    
+    // Paths to meteor assets
+    let meteor_paths = [
+        "models/obstacles/meteor.glb#Scene0",
+        "models/obstacles/meteor_detailed.glb#Scene0",
+        "models/obstacles/meteor_half.glb#Scene0",
+    ];
+
+    let meteor_models: Vec<Handle<Scene>> = meteor_paths
+        .iter()
+        .map(|path| asset_server.load(*path))
+        .collect();
+
+    // Volume configuration
+    const METEOR_COUNT: usize = 100;
+    const RANGE_XZ: f32 = 2500.0;
+    const RANGE_Y_MIN: f32 = 50.0;
+    const RANGE_Y_MAX: f32 = 1200.0;
+    const PLAYER_SAFE_ZONE: f32 = 100.0; // Don't spawn within 100m of (0, 500, 0)
+
+    for i in 0..METEOR_COUNT {
+        // Random position
+        let mut pos = Vec3::new(
+            rng.gen_range(-RANGE_XZ..RANGE_XZ),
+            rng.gen_range(RANGE_Y_MIN..RANGE_Y_MAX),
+            rng.gen_range(-RANGE_XZ..RANGE_XZ),
+        );
+
+        // Ensure safe zone around player spawn (0, 500, 0)
+        let player_spawn = Vec3::new(0.0, 500.0, 0.0);
+        if pos.distance(player_spawn) < PLAYER_SAFE_ZONE {
+            pos.x += PLAYER_SAFE_ZONE; // Simple push-out
+        }
+
+        // Random rotation and scale
+        let rotation = Quat::from_euler(
+            EulerRot::XYZ,
+            rng.gen_range(0.0..std::f32::consts::TAU),
+            rng.gen_range(0.0..std::f32::consts::TAU),
+            rng.gen_range(0.0..std::f32::consts::TAU),
+        );
+        let scale = rng.gen_range(5.0..25.0); // meteors need to be decently big
+
+        // Select random model
+        let model_handle = meteor_models[rng.gen_range(0..meteor_models.len())].clone();
+
+        commands.spawn((
+            Meteor,
+            SceneRoot(model_handle),
+            Transform {
+                translation: pos,
+                rotation,
+                scale: Vec3::splat(scale),
+            },
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+            RigidBody::Static,
+            // Use sphere collider for performance (radius matches scale approx)
+            Collider::sphere(0.8), // Radius in local space, will be scaled by transform
+        ));
+
+        if i == 0 {
+            println!("☄️  Meteors spawning initiated...");
+        }
+    }
 }
 
 fn spawn_player(

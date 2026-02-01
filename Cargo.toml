@@ -7,6 +7,7 @@ edition = "2021"
 # Removed dynamic_linking due to linker issues on Windows
 bevy = { version = "0.15" }
 avian3d = { version = "0.2", features = ["f32"] }
+rand = "0.8"
 
 # Development Profile (cargo run)
 [profile.dev]
