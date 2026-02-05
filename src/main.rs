@@ -1,10 +1,14 @@
 use bevy::{
     pbr::{CascadeShadowConfigBuilder, DirectionalLightShadowMap},
     prelude::*,
+    render::mesh::VertexAttributeValues,
 };
 use avian3d::prelude::*;
 use rand::prelude::*;
 use std::io::Write;
+
+mod drone;
+use drone::{Drone, DronePlugin};
 
 // #region agent log
 fn debug_log(location: &str, message: &str, data: &str, hypothesis_id: &str) {
@@ -51,7 +55,7 @@ struct Particle {
 }
 
 /// Chunk coordinate system
-#[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
 struct ChunkCoordinate {
     x: i32,
     z: i32,
@@ -473,6 +477,7 @@ fn main() {
         .init_resource::<F16AeroData>() // Load Aero Data
         .init_resource::<SoundAssets>() // NEW: Load Sounds
         .init_resource::<ChunkManager>() // NEW: Chunk Manager
+        .add_plugins(DronePlugin)
         .add_systems(Startup, setup_scene)
         // .add_systems(Startup, spawn_village) // REMOVED: Replaced by chunk system
         .add_systems(Startup, spawn_realistic_clouds) // NEW: Spawn realistic clouds
@@ -512,6 +517,7 @@ fn main() {
             handle_shooting_input,
             update_projectiles,
             handle_projectile_collisions,
+            drone_projectile_collision,
             update_muzzle_flashes,
             update_explosion_effects, // Clean up explosion effects
         ))
@@ -538,7 +544,6 @@ fn setup_scene(
             ..default()
         },
         // Tuned shadow config for Flight Sim scale (large distances)
-        // Default is too small (optimized for indoor scenes), causing shadows to disappear when flying high
         CascadeShadowConfigBuilder {
             num_cascades: 4,
             minimum_distance: 0.1,
@@ -558,7 +563,6 @@ fn setup_scene(
     });
 
     // Spawn Sky Sphere
-    // This creates a massive sphere around the player with the HDR texture applied to the inside
     commands.spawn((
         SkySphere,
         Mesh3d(meshes.add(Mesh::from(Sphere::new(20000.0)))),
@@ -575,26 +579,28 @@ fn setup_scene(
     ));
 
     // Spawn Infinite Horizon Disk (The "World Floor")
-    // This fills the gap between loaded chunks and the sky
+    // FIX: Make it GREEN to match chunks, and enable fog so they fade together.
+    // This hides the jagged edges by placing a matching color floor underneath.
     commands.spawn((
         HorizonDisk,
-        Mesh3d(meshes.add(Mesh::from(Circle::new(40000.0)))), // 40km radius circle
+        Mesh3d(meshes.add(Mesh::from(Circle::new(100000.0)))), // 100km radius
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgba(0.5, 0.6, 0.8, 1.0), // EXACT match to fog color
-            unlit: true, // Unlit so it doesn't get shadowed
-            fog_enabled: false, // Don't let fog affect it (it IS the fog color)
+            base_color: Color::srgb(0.25, 0.3, 0.25), // Match ground chunk color EXACTLY
+            perceptual_roughness: 0.95, // Match ground roughness
+            reflectance: 0.0,
+            unlit: false, // React to light like chunks
+            fog_enabled: true, // Fade to blue sky like chunks
             ..default()
         })),
-        // Y = -2.0 ensures it's just below the ground chunks (Y=0 or -1) but above the void
+        // Y = -500.0 ensures it's far below the ground chunks to prevent "Blue Cube" glitch
         Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
-            .with_translation(Vec3::new(0.0, -2.0, 0.0)), 
+            .with_translation(Vec3::new(0.0, -500.0, 0.0)), 
         GlobalTransform::default(),
         Visibility::default(),
         InheritedVisibility::default(),
     ));
 
     // GLOBAL GROUND REMOVED - Replaced by Chunk System
-    // Ground is now spawned dynamically in chunks around the player.
 
     // Add a debug grid plane high above to show altitude/pitch reference
     let debug_grid_size = 20000.0;
@@ -643,25 +649,54 @@ fn setup_scene(
         ));
     }
 
-    // Bevy 0.15: use DistanceFog (FogSettings was renamed/deprecated)
-    // FIX: Synced fog with chunk load distance to hide edges
-    // Chunks load up to 8000m. Fog must be opaque before then.
+    // Bevy 0.15: use DistanceFog
+    // FIX: Tightened fog to 3000-6000m to insure opacity before chunks end
     commands.spawn((
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
-            far: 50000.0,  // Increased to safely cover horizon disk (40km)
+            far: 50000.0,  // Cover horizon disk
             ..default()
         }),
         DistanceFog {
             color: Color::srgba(0.5, 0.6, 0.8, 1.0), // Match skybox/ClearColor
             falloff: FogFalloff::Linear {
-                start: 5000.0, // Start fading sooner
-                end: 7500.0,   // Opaque BEFORE chunk edge (8000m)
+                start: 3000.0, // Start fading sooner
+                end: 6000.0,   // Fully Opaque well before 8000m chunk edge
             },
             ..default()
         },
         Transform::from_xyz(0.0, 50.0, 15.0).looking_at(Vec3::ZERO, Vec3::Y),
         GlobalTransform::default(),
+    ));
+
+    // Spawn test drones in close formation (Option B)
+    // Drone 1: Directly ahead, slightly above
+    crate::drone::spawn_beaver_drone(&mut commands, &asset_server, &mut meshes, &mut materials, Vec3::new(0.0, 520.0, -200.0));
+    // Drone 2: Left flank
+    crate::drone::spawn_beaver_drone(&mut commands, &asset_server, &mut meshes, &mut materials, Vec3::new(-150.0, 500.0, -100.0));
+    // Drone 3: Right flank
+    crate::drone::spawn_beaver_drone(&mut commands, &asset_server, &mut meshes, &mut materials, Vec3::new(150.0, 500.0, -100.0));
+
+    // Additional Long Range Drones for HUD testing
+    crate::drone::spawn_beaver_drone(&mut commands, &asset_server, &mut meshes, &mut materials, Vec3::new(500.0, 1500.0, -2000.0));
+    crate::drone::spawn_beaver_drone(&mut commands, &asset_server, &mut meshes, &mut materials, Vec3::new(-500.0, 1200.0, -3000.0));
+    crate::drone::spawn_beaver_drone(&mut commands, &asset_server, &mut meshes, &mut materials, Vec3::new(0.0, 2000.0, -5000.0));
+
+    // Spawn visible red cube to test positioning (Option C)
+    commands.spawn((
+        Mesh3d(meshes.add(Mesh::from(Cuboid::new(20.0, 20.0, 20.0)))), // 20m radius -> 40m cube
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.0, 0.0),  // Bright red
+            emissive: LinearRgba::rgb(5.0, 0.0, 0.0),
+            ..default()
+        })),
+        Transform {
+            translation: Vec3::new(0.0, 510.0, -150.0),
+            rotation: Quat::from_rotation_y(std::f32::consts::PI), // Match drone rotation
+            ..default()
+        },
+        drone::Drone { health: 50.0, speed: 150.0 }, // Higher speed
+        drone::KamikazeBehavior,
     ));
 }
 
@@ -821,6 +856,14 @@ fn spawn_chunk(
     chunk_coord: ChunkCoordinate,
 ) -> Entity {
     let chunk_pos = chunk_coord.world_position();
+    
+    // SAFETY: Ensure chunk position is valid
+    if chunk_pos.is_nan() || !chunk_pos.is_finite() {
+        eprintln!("❌ CHUNK SPAWN ERROR: Invalid chunk_pos for {:?}", chunk_coord);
+        // Return a dummy entity to avoid breaking the caller, but this should be extremely rare
+        return commands.spawn_empty().id();
+    }
+
     println!("🌍 CHUNK SPAWN: coord=({},{}), world_pos=({:.0},{:.0},{:.0})",
         chunk_coord.x, chunk_coord.z, chunk_pos.x, chunk_pos.y, chunk_pos.z);
 
@@ -833,28 +876,55 @@ fn spawn_chunk(
         InheritedVisibility::default(),
     )).id();
 
+    // Load PNG textures - attempt with handles for debugging
+    eprintln!("🌿 TEXTURE LOAD: Loading PNG textures...");
+    let base_color_handle = asset_server.load("textures/grass/grass_BaseColor.png");
+    let normal_handle = asset_server.load("textures/grass/grass_Normal.png");
+
     let ground_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.25, 0.3, 0.25),
-        perceptual_roughness: 0.95,
+        base_color: Color::srgb(0.8, 0.8, 0.75),  // Light beige base
+        base_color_texture: Some(base_color_handle),
+        normal_map_texture: Some(normal_handle),
+        perceptual_roughness: 0.85,
+        reflectance: 0.03,
+        metallic: 0.0,
         ..default()
     });
 
     commands.entity(chunk_entity).with_children(|parent| {
-        parent.spawn((
-            ChunkEntity,
-            chunk_coord,
-            Mesh3d(meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(CHUNK_SIZE)))),
-            MeshMaterial3d(ground_material),
-            Transform::from_xyz(0.0, -1.0, 0.0),
-            GlobalTransform::default(),
-            Visibility::default(),
-            InheritedVisibility::default(),
-            RigidBody::Static,
-            Collider::cuboid(CHUNK_SIZE / 2.0, 0.5, CHUNK_SIZE / 2.0),
-        ));
+        let half_size = CHUNK_SIZE / 2.0;
+        let thickness = 0.5;
+        
+        // Final sanity check for collider dimensions
+        if half_size > 0.0 && half_size.is_finite() && thickness > 0.0 {
+            // Create ground mesh with UV tiling for texture detail
+            let mut mesh = Mesh::from(Plane3d::new(Vec3::Y, Vec2::splat(CHUNK_SIZE)));
+            if let Some(VertexAttributeValues::Float32x2(uvs)) = mesh.attribute_mut(Mesh::ATTRIBUTE_UV_0) {
+                for uv in uvs {
+                    uv[0] *= 100.0;  // Tile 100x (reduced from 250 for testing)
+                    uv[1] *= 100.0;
+                }
+            }
+
+            parent.spawn((
+                ChunkEntity,
+                chunk_coord,
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(ground_material),
+                Transform::from_xyz(0.0, -1.0, 0.0),
+                GlobalTransform::default(),
+                Visibility::default(),
+                InheritedVisibility::default(),
+                RigidBody::Static,
+                Collider::cuboid(half_size, thickness, half_size),
+            ));
+        } else {
+            eprintln!("❌ CHUNK SPAWN ERROR: Invalid collider dimensions for chunk {:?}", chunk_coord);
+        }
     });
 
     spawn_trees_in_chunk(commands, asset_server, meshes, materials, chunk_coord, chunk_pos, chunk_entity);
+    spawn_rocks_in_chunk(commands, meshes, materials, chunk_coord, chunk_pos, chunk_entity); // Added rocks
 
     if should_spawn_village(chunk_coord) {
         spawn_village_in_chunk(commands, asset_server, chunk_coord, chunk_pos, chunk_entity);
@@ -882,8 +952,8 @@ fn propagate_no_frustum_culling(
 fn spawn_trees_in_chunk(
     commands: &mut Commands,
     asset_server: &AssetServer,
-    _meshes: &mut Assets<Mesh>,
-    _materials: &mut Assets<StandardMaterial>,
+    meshes: &mut Assets<Mesh>, // Unused _ removed
+    materials: &mut Assets<StandardMaterial>, // Unused _ removed
     chunk_coord: ChunkCoordinate,
     _chunk_pos: Vec3,
     chunk_entity: Entity,
@@ -896,6 +966,7 @@ fn spawn_trees_in_chunk(
     let tree_count = chunk_rng.gen_range(TREES_PER_CHUNK_MIN..=TREES_PER_CHUNK_MAX);
     println!("🌲 Spawning {} trees in chunk ({},{})", tree_count, chunk_coord.x, chunk_coord.z);
 
+    // Add #Mesh0/Primitive0 to target the mesh data directly inside the GLB
     let tree_models = vec![
         "fantasy_town/tree.glb",
         "fantasy_town/tree-crooked.glb",
@@ -903,6 +974,14 @@ fn spawn_trees_in_chunk(
         "fantasy_town/tree-high-crooked.glb",
         "fantasy_town/tree-high-round.glb",
     ];
+
+    // Create a shared green material for all trees
+    let tree_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.1, 0.5, 0.1), // Grass green
+        perceptual_roughness: 0.9,
+        reflectance: 0.1,
+        ..default()
+    });
 
     commands.entity(chunk_entity).with_children(|parent| {
         for _ in 0..tree_count {
@@ -914,7 +993,7 @@ fn spawn_trees_in_chunk(
             }
 
             let model_index = chunk_rng.gen_range(0..tree_models.len());
-            let tree_model = tree_models[model_index];
+            let tree_model_path = format!("{}#Mesh0/Primitive0", tree_models[model_index]);
             let scale = chunk_rng.gen_range(3.0..6.0);
 
             // Use LOCAL coordinates because trees are now children of the chunk
@@ -925,7 +1004,9 @@ fn spawn_trees_in_chunk(
                 ChunkEntity,
                 chunk_coord,
                 LODLevel(0),
-                SceneRoot(asset_server.load(tree_model)),
+                // DIRECT MESH LOADING (Option 1)
+                Mesh3d(asset_server.load(tree_model_path)),
+                MeshMaterial3d(tree_material.clone()), // Apply green material
                 Transform {
                     translation: tree_local_pos,
                     rotation: Quat::from_rotation_y(chunk_rng.gen_range(0.0..std::f32::consts::TAU)),
@@ -938,16 +1019,93 @@ fn spawn_trees_in_chunk(
     });
 }
 
+fn spawn_rocks_in_chunk(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    chunk_coord: ChunkCoordinate,
+    _chunk_pos: Vec3,
+    chunk_entity: Entity,
+) {
+    use rand::SeedableRng;
+    // Different seed than trees so rocks are in different spots
+    let seed = ((chunk_coord.x as i64 * 19349663) ^ (chunk_coord.z as i64 * 73856093)) as u64;
+    let mut chunk_rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+    let rock_count = chunk_rng.gen_range(2..=4);
+    
+    let rock_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.6, 0.5, 0.4), // Gray-brown rock
+        perceptual_roughness: 0.9,
+        ..default()
+    });
+
+    let rock_mesh = meshes.add(Cuboid::new(20.0, 15.0, 20.0)); // 20m rocks
+
+    commands.entity(chunk_entity).with_children(|parent| {
+        for _ in 0..rock_count {
+            let x = chunk_rng.gen_range(-CHUNK_SIZE/2.0..CHUNK_SIZE/2.0);
+            let z = chunk_rng.gen_range(-CHUNK_SIZE/2.0..CHUNK_SIZE/2.0);
+
+            // Avoid village center if necessary, but rocks are tough so maybe it's fine
+            if should_spawn_village(chunk_coord) && (x*x + z*z < 400.0*400.0) {
+                 continue;
+            }
+
+            let scale = chunk_rng.gen_range(0.8..1.5);
+            let rotation = Quat::from_rotation_y(chunk_rng.gen_range(0.0..std::f32::consts::TAU));
+
+            parent.spawn((
+                ChunkEntity,
+                chunk_coord,
+                Mesh3d(rock_mesh.clone()),
+                MeshMaterial3d(rock_material.clone()),
+                Transform {
+                    translation: Vec3::new(x, 7.5 * scale, z), // Half height so it sits on ground
+                    rotation,
+                    scale: Vec3::splat(scale),
+                },
+                GlobalTransform::default(),
+                Visibility::default(),
+                InheritedVisibility::default(),
+                RigidBody::Static,
+                Collider::cuboid(10.0, 7.5, 10.0), // Half-extents
+            ));
+        }
+    });
+}
+
 /// Global safety system to prevent NaN values from crashing the physics engine
 fn safety_check_nan(
-    mut query: Query<(Entity, &mut Transform, Option<&mut LinearVelocity>, Option<&mut AngularVelocity>)>,
+    mut query: Query<(
+        Entity, 
+        &mut Transform, 
+        Option<&mut LinearVelocity>, 
+        Option<&mut AngularVelocity>,
+        Option<&mut Position>,
+        Option<&mut Rotation>,
+    )>,
 ) {
-    for (entity, mut transform, mut opt_lin_vel, mut opt_ang_vel) in &mut query {
+    for (entity, mut transform, mut opt_lin_vel, mut opt_ang_vel, mut opt_pos, mut opt_rot) in &mut query {
         let mut needs_reset = false;
         
         if transform.translation.is_nan() || transform.rotation.is_nan() || transform.scale.is_nan() {
             needs_reset = true;
             eprintln!("⚠️ SAFETY: Detected NaN in Transform for entity {:?}.", entity);
+        }
+
+        if let Some(ref pos) = opt_pos {
+            if pos.0.is_nan() {
+                needs_reset = true;
+                eprintln!("⚠️ SAFETY: Detected NaN in Position for entity {:?}.", entity);
+            }
+        }
+
+        if let Some(ref rot) = opt_rot {
+            if rot.0.is_nan() {
+                needs_reset = true;
+                eprintln!("⚠️ SAFETY: Detected NaN in Rotation for entity {:?}.", entity);
+            }
         }
         
         if let Some(ref lin_vel) = opt_lin_vel {
@@ -969,6 +1127,12 @@ fn safety_check_nan(
             transform.rotation = Quat::IDENTITY;
             transform.scale = Vec3::ONE;
             
+            if let Some(ref mut pos) = opt_pos {
+                pos.0 = Vec3::ZERO;
+            }
+            if let Some(ref mut rot) = opt_rot {
+                rot.0 = Quat::IDENTITY;
+            }
             if let Some(ref mut lin_vel) = opt_lin_vel {
                 **lin_vel = LinearVelocity::ZERO;
             }
@@ -1866,16 +2030,16 @@ fn arcade_flight_physics(
                           forward * input.roll * ROLL_RATE;
 
         // Smooth interpolation for natural feel - NaN PROTECTION
-        if !target_omega.is_nan() {
+        if !target_omega.is_nan() && target_omega.is_finite() {
              ang_vel.0 = ang_vel.0.lerp(target_omega, SMOOTHING_FACTOR);
         }
 
         // ===== 2. DRAG =====
         let speed = velocity.length();
-        if speed > 1.0 {
+        if speed > 1.0 && speed.is_finite() {
             // SAFE NORMALIZATION: Prevent division by zero if velocity is tiny
             let drag_force = -velocity.0.normalize_or_zero() * speed * speed * DRAG_COEFFICIENT;
-            if !drag_force.is_nan() {
+            if !drag_force.is_nan() && drag_force.is_finite() {
                 ext_force.apply_force(drag_force);
             }
         }
@@ -1887,8 +2051,12 @@ fn arcade_flight_physics(
         // Decompose thrust into forward and vertical components based on pitch
         // CLAMP INPUTS to prevent runaway values
         let safe_throttle = input.throttle.clamp(0.0, 1.0);
-        let vertical_component = safe_throttle * MAX_THRUST_NEWTONS * pitch_angle.sin();
-        let forward_component = safe_throttle * MAX_THRUST_NEWTONS * pitch_angle.cos();
+        
+        // Final pitch safety check
+        let safe_pitch = if pitch_angle.is_nan() || !pitch_angle.is_finite() { 0.0 } else { pitch_angle };
+        
+        let vertical_component = safe_throttle * MAX_THRUST_NEWTONS * safe_pitch.sin();
+        let forward_component = safe_throttle * MAX_THRUST_NEWTONS * safe_pitch.cos();
 
         // Apply boost multiplier when throttle is high
         let mut boost_mult = if safe_throttle > BOOST_THRESHOLD { BOOST_MULTIPLIER } else { 1.0 };
@@ -1903,7 +2071,7 @@ fn arcade_flight_physics(
 
         let thrust_force = (forward * forward_component + up * vertical_component) * boost_mult;
         
-        if !thrust_force.is_nan() {
+        if !thrust_force.is_nan() && thrust_force.is_finite() {
             ext_force.apply_force(thrust_force);
         }
 
@@ -2221,6 +2389,55 @@ fn update_projectiles(
     }
 }
 
+fn drone_projectile_collision(
+    mut commands: Commands,
+    projectiles: Query<(Entity, &Transform), With<Projectile>>,
+    mut drones: Query<(Entity, &mut Drone, &Transform)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    // Collision detection loop
+    for (proj_entity, proj_transform) in &projectiles {
+        for (drone_entity, mut drone, drone_transform) in &mut drones {
+            // Calculate distance between projectile and drone
+            let distance = proj_transform.translation.distance(drone_transform.translation);
+
+            // Hit radius: 50m (generous for testing)
+            if distance < 50.0 {
+                println!("💥 HIT DRONE! Distance: {:.1}m", distance);
+
+                // Deal 25 damage per hit
+                drone.health -= 25.0;
+                println!("🎯 Drone health: {:.1}", drone.health);
+
+                // Despawn the projectile (it exploded)
+                commands.entity(proj_entity).despawn();
+
+                // Check if drone died
+                if drone.health <= 0.0 {
+                    println!("💀 DRONE DESTROYED!");
+
+                    // Spawn explosion effect
+                    commands.spawn((
+                        Mesh3d(meshes.add(Mesh::from(Sphere { radius: 30.0 }))),
+                        MeshMaterial3d(materials.add(StandardMaterial {
+                            base_color: Color::srgb(1.0, 0.5, 0.0),  // Orange
+                            emissive: LinearRgba::rgb(5.0, 2.0, 0.0),  // Glow
+                            ..default()
+                        })),
+                        Transform::from_translation(drone_transform.translation),
+                        // Add explosion effect component to auto-despawn
+                        ExplosionEffect { lifetime: 0.0, max_lifetime: 1.0 },
+                    ));
+
+                    // Despawn the drone
+                    commands.entity(drone_entity).despawn();
+                }
+            }
+        }
+    }
+}
+
 fn handle_projectile_collisions(
     mut collision_events: EventReader<Collision>,
     projectile_query: Query<Entity, With<Projectile>>,
@@ -2449,6 +2666,15 @@ fn check_ground_collision(
             continue;
         }
 
+        // SAFETY FIX: Check for Extreme Values (Dark Bar Glitch)
+        if transform.translation.y > 100_000.0 || transform.translation.y < -1000.0 {
+             eprintln!("⚠️ SAFETY: Detected Extreme Y Position! Resetting.");
+             transform.translation = Vec3::new(0.0, 500.0, 0.0);
+             *velocity = LinearVelocity::ZERO;
+             *ang_vel = AngularVelocity::ZERO;
+             continue;
+        }
+
         if transform.translation.y <= GROUND_LEVEL {
             let crash_speed = velocity.length();
 
@@ -2658,6 +2884,9 @@ fn spawn_afterburner_particles(
                 1.2 + input.throttle * 1.5
             };
             
+            // Safety Clamp to prevent giant needles
+            let size = size.clamp(0.1, 10.0);
+            
             let quad_mesh = meshes.add(Mesh::from(Rectangle::new(size, size)));
 
             commands.spawn((
@@ -2699,6 +2928,12 @@ fn update_particles(
     // #endregion
 
     for (entity, mut transform, mut particle, material_handle) in &mut particle_query {
+        // NaN CHECK
+        if transform.translation.is_nan() {
+            commands.entity(entity).despawn();
+            continue;
+        }
+
         // #region agent log
         log_count += 1;
         if log_count == 1 {
