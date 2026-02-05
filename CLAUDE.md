@@ -1,0 +1,247 @@
+# Plane Game - Claude Development Context
+
+## Project Overview
+F-16 flight simulator with infinite procedurally-generated terrain, chunk-based world loading, and arcade physics. Built with Bevy 0.15 + Avian3D physics.
+
+**Status:** Phase 1 & 2 COMPLETE - Chunk-based infinite world with 3000+ procedurally-placed trees and villages, rocket mode (8x thrust, reaches 25km in ~12 sec), sky→space transition. Currently: Testing actual .glb asset rendering (using green cube placeholders); NaN physics crash protection active.
+
+## User Design Goals (Multi-Session Coordination)
+
+**High Priority:**
+- World size: As large as possible without crashing
+- Asset distribution: Tons of medieval villages and forest sections scattered throughout
+- Performance: Must run on RTX 3080 Ti + Ryzen 7 5800X without lag
+- Visual style: Mix of Kenney assets (currently used for terrain)
+
+**Phase 2 Features (IMPLEMENTED):**
+- ✅ Rocket booster mode (R key toggle): 8x thrust multiplier, reaches 25km in ~12 seconds
+- ✅ Sky→space transition: Gradual color change from blue to black (15-25km range)
+
+**Phase 3+ Features (Not Yet Started):**
+- Air combat: Drones (like Ukrainian military drones) to shoot down - **BLOCKED on drone 3D models**
+- Speed counter UI: Show velocity numerically (design ready)
+- Cockpit view: Future addition (steal code from open-source plane game if available)
+- Day/night cycle: Currently always ambient lighting on
+- Ground texture/grid: Make speed visible through ground pattern
+
+**Design Constraints:**
+- Keep current camera system for now (3rd person view behind plane)
+- Use OGG audio only (rodio crashes on cover art metadata)
+- Performance target: 60+ FPS during normal flight
+
+## Gameplay Features (Already Implemented - From Gemini Session)
+
+### Game States
+- **Playing:** Normal flight, altitude > 50m, fuel available
+- **GameOver:** Crash when altitude < 50m or velocity > 50m/s impact
+
+### Controls
+- **W/S:** Pitch (nose up/down)
+- **A/D:** Roll (barrel roll)
+- **Q/E:** Yaw (turn left/right)
+- **Shift:** Throttle/Boost (increases fuel burn rate)
+- **Ctrl:** Brake
+- **R:** Toggle Rocket Mode (8x thrust multiplier)
+- **Space:** Fire (weapons - fires sprite particles)
+
+### Systems Implemented
+- **Fuel System:** Resource logic with idle burn rate (normal flight) and boost burn rate (afterburner)
+- **UI:** Retro "Gas Canister" icon + dynamic fuel bar (color changes with fuel level)
+- **Audio:** Engine loop (pitch varies with throttle), wind noise (airspeed), altitude alarms, crash impact sound
+- **Physics:** Hybrid system - Avian3D AABB collisions + custom arcade flight physics (bank-to-turn model)
+- **Particles:** Afterburner flame inherits 20% of plane velocity for realistic trails, scales 3x with boost
+
+## Critical Architecture
+
+### World System
+- **Chunk size:** 1000m × 1000m
+- **Load radius:** 8 chunks (8km buffer) - CRITICAL: prevents ground holes
+- **Unload radius:** 12 chunks (12km)
+- **Trees per chunk:** 5-10 (was 50, reduced for performance)
+- **Tree Y position:** 0.0 (ground level, not 1.0)
+- **Chunk coordinates:** Calculated via `ChunkCoordinate::from_world_pos(pos) = (pos.x / 1000).floor() as i32`
+
+### Asset Loading Gotchas
+- **SceneRoot with `#Scene0` selector DOESN'T WORK** - Bevy 0.15 doesn't load scene children properly
+  - `.glb` files load but don't spawn visible children
+  - Workaround: Use `Mesh3d + MeshMaterial3d` instead (direct mesh loading)
+  - Currently spawning green test cubes (proof of concept)
+- **Assets must be in `target/release/assets/`** - game runs from executable, not source
+  - Copy assets after every code change: `cp -r assets target/release/`
+- **All asset paths are case-sensitive** (even on Windows with Bevy)
+
+### Lighting & Rendering
+- **Ambient light is ESSENTIAL** - without it, all models render pitch black
+  - Added: `AmbientLight { color: WHITE, brightness: 200.0 }` in setup_scene()
+  - Without this, trees were invisible despite being spawned
+- **Camera far clip plane MUST match fog distance** - prevents jagged edges at horizon
+  - Default Camera3d has far clip of 1000m, but fog ends at 10,000m
+  - **FIX:** Set `Projection::Perspective { far: 25000.0, ..default() }`
+  - Geometry was being clipped by camera before fading into fog
+- **NoFrustumCulling component** - used to prevent frustum culling issues with loaded scenes
+  - Added to tree entities to guarantee visibility
+- **DirectionalLight** - illuminance 30000.0 with shadows enabled
+
+### Physics Safety
+- **NaN crash protection:** Check for NaN in `check_ground_collision()` before physics updates
+  - Detects invalid transform/velocity and resets player to (0, 500, 0)
+  - Prevents avian3d AABB panic crashes
+
+## Debugging Techniques That Worked
+
+1. **Entity hierarchy inspection** - Add system that checks `if children.len() > 0` to verify SceneRoot spawned children
+2. **LOD visibility tracking** - Print visible/hidden tree counts every frame to spot culling issues
+3. **Chunk position logging** - Print chunk coordinates and world positions when spawning/unloading
+4. **Test mesh substitution** - Replace problematic assets with Cuboid to test rendering pipeline
+5. **System ordering matters** - Move LOD to PostUpdate instead of Update so newly-spawned trees are visible
+
+## Common Errors & Fixes
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| "Path not found: assets/..." | Assets in src/assets, not target/release/assets | Copy: `cp -r assets target/release/` |
+| Jagged edges at horizon | Camera far clip (1000m) < fog distance (10km) | Set Projection::Perspective { far: 25000.0 } |
+| Trees exist but invisible | Zero ambient light | Add AmbientLight resource in setup_scene() |
+| Ground has holes/gaps | LOAD_RADIUS too small (5km) | Increase to 8km for 3km cushion |
+| Trees appearing but then disappearing | LOD system hiding them | Move LOD to PostUpdate schedule |
+| SceneRoot children not visible | Bevy 0.15 visibility bug | Use Mesh3d + MeshMaterial3d instead |
+| Player crash (NaN panic) | Invalid physics state | Add NaN check in check_ground_collision() |
+
+## File Locations
+
+- **Core:** `src/main.rs` (2540+ lines)
+  - Chunk system: lines 587-652 (manage_chunks)
+  - Tree spawning: lines 803-870 (spawn_trees_in_chunk)
+  - LOD system: lines 701-735 (update_lod_levels)
+  - Physics safety: lines 2267-2295 (check_ground_collision)
+  - Lighting & Camera: lines 511-602 (setup_scene) - includes AmbientLight + far clip fix
+
+- **Assets:** `assets/fantasy_town/` (167 files)
+  - Trees: tree.glb, tree-crooked.glb, tree-high.glb, tree-high-crooked.glb, tree-high-round.glb
+  - Buildings: wall.glb, roof-gable.glb (5 variants tested)
+  - Building components: 160+ decoration assets
+
+## Performance Baseline (Current)
+
+- **Chunk load radius:** 8km
+- **Trees per chunk:** 5-10
+- **Total entities:** ~360-500 trees + ground meshes + UI
+- **FPS target:** 60+ (current: playable, not measured)
+- **GPU:** RTX 3080 Ti
+- **CPU:** Ryzen 7 5800X
+
+**Scaling notes:** Reducing tree count works, increasing radius causes lag. The 8km/12km ratio provides good balance.
+
+## Next Steps (Priority Order)
+
+1. **CRITICAL: Fix .glb asset rendering** - Currently using green cube placeholders
+   - Issue: SceneRoot doesn't spawn visible children in Bevy 0.15
+   - Solution: Load Mesh directly from glTF + apply StandardMaterial
+   - Files: Tree spawning at lines 803-870, need new asset loading code
+
+2. **Fix physics horizon glitch** - Camera far clip or fog distance mismatch
+   - Check: Camera far clip plane vs DistanceFog end distance
+   - Reference: CLAUDE.md line 76 has camera far clip fix documented
+
+3. **Test complete Phase 1 & 2** - Run game and verify:
+   - Ground renders continuously without holes ✓ (8km load radius)
+   - Trees spawn and despawn properly ✓ (chunk system)
+   - Rocket mode reaches 25km in expected time ✓
+   - FPS stays 60+ ✓
+
+4. **Phase 3 Combat System** - Ready to start when user provides drone 3D models
+   - Prompts available in PHASE3_IMPLEMENTATION_PROMPTS.md
+   - Design: Swarm AI + Kamikaze AI + weapon system
+   - Effort: ~12 hours (blocked on assets)
+
+5. **Optional Polish** - After Phase 3 or if combat blocked:
+   - Add ground grid texture for speed feedback
+   - Implement proper LOD mesh variants (instead of just visibility toggle)
+   - Add building colliders to villages
+   - Improve particle effects
+
+## Bash Commands Useful for This Project
+
+```bash
+# Copy assets to release build
+cp -r /c/Users/Box/plane_game/assets /c/Users/Box/plane_game/target/release/
+
+# Build and run (release mode)
+cd /c/Users/Box/plane_game && cargo build --release && target/release/plane_game.exe
+
+# Quick test (8 second timeout)
+cd /c/Users/Box/plane_game && timeout 8 target/release/plane_game.exe 2>&1 | grep -E "(LOD|CHUNK|SPAWN|children)"
+
+# Check asset file types
+file /c/Users/Box/plane_game/assets/fantasy_town/*.glb
+
+# List all .glb files
+ls -lh /c/Users/Box/plane_game/assets/fantasy_town/*.glb
+
+# Sync code to Google Drive (from Gemini workflow)
+robocopy "C:\Users\Box\plane_game" "G:\My Drive\plane_game" /MIR /XD target
+
+# Fix OGG audio files (remove cover art that crashes rodio)
+ffmpeg -i input.ogg -vn -c:a copy output.ogg
+```
+
+## Known Limitations
+
+- **SceneRoot broken in Bevy 0.15** for simple .glb files (no scene hierarchy)
+  - Workaround: Load Mesh directly from glTF instead
+- **No multi-GPU support** - single-threaded asset loading can stall frames
+- **Collision system** - only checks Y position, not actual AABB collision
+- **No night mode** - AmbientLight always on, no day/night cycle
+- **Player starts at (0, 500, 0)** - no spawn point variation
+- **Audio:** OGG files with cover art crash rodio - must remove metadata with ffmpeg first
+- **Line Endings:** Windows Git uses CRLF by default, but Rust/Config files need LF only
+
+## Code Patterns
+
+- **Chunk spawning:** Always spawn as children of chunk entity via `with_children(|parent| { parent.spawn(...) })`
+- **Visibility toggle:** Use `LODLevel(0)` component + `Visibility::Inherited` on all renderable entities
+- **Transform hierarchy:** Child entities use LOCAL coordinates; chunk parent handles world positioning
+- **Component naming:** Use clear prefixes (Tree, VillageBuilding, ChunkEntity) for system queries
+- **Debug logging:** Use eprintln!() for console output (survives release builds)
+
+## Testing Checklist
+
+- [ ] Ground renders without holes at all altitudes
+- [ ] Trees appear with correct lighting (visible, not black)
+- [ ] No crashes when flying fast (NaN protection working)
+- [ ] Assets load from target/release/assets/ correctly
+- [ ] Frame rate stable at 60+ FPS when flying
+- [ ] Chunk loading/unloading smooth (no sudden pops)
+
+## Multi-Chat Coordination
+
+**Sessions Working on This Project:**
+1. **Gemini Chat:** Gameplay implementation (controls, fuel system, audio, particles, physics hybrid model)
+2. **Claude Chat (2026-02-05):** Phase 1 asset rendering debugging - fixed invisible trees via 7 emergency fixes
+3. **Copilot Chat:** (Referenced, current context unknown)
+4. **User Notes:** Design goals and preferences documented in HomeBrain Sync
+
+**Shared Context Location:**
+- `C:\Users\Box\Documents\HomeBrain SYNC\Inbox\Plane Game Notes.md` - Central hub for all chat summaries
+- `C:\Users\Box\plane_game\CLAUDE.md` - Team documentation (this file)
+- `C:\Users\Box\plane_game\.claude.local.md` - Local development notes
+- `C:\Users\Box\plane_game\FIXES_APPLIED.md` - Emergency fixes applied in latest session
+
+---
+
+---
+
+## AI Workflow & Maintenance
+
+**Memory File Status:** CLAUDE.md is the Source of Truth
+- Updated whenever major features complete or blockers identified
+- Consolidates knowledge from multi-chat sessions (Gemini, Claude, Copilot)
+- New sessions: Start by reading main.rs + CLAUDE.md only
+
+**Project Files:** Recently cleaned (27 outdated .md files removed on 2026-02-05)
+- **KEEP:** README.md, CLAUDE.md, GAME_DESIGN.md, FIXES_APPLIED.md, PHASE3_IMPLEMENTATION_PROMPTS.md
+- **Git Strategy:** Run `git commit` before major refactors as safety checkpoint
+- **Code Management:** Keep main.rs under 1500-2000 lines before splitting
+
+**Last Updated:** 2026-02-05 (File cleanup + CLAUDE.md refresh + AI workflow documentation)
+**Next Review:** Before starting asset loading fix or any major refactor

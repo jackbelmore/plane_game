@@ -1,4 +1,7 @@
-use bevy::prelude::*;
+use bevy::{
+    pbr::{CascadeShadowConfigBuilder, DirectionalLightShadowMap},
+    prelude::*,
+};
 use avian3d::prelude::*;
 use rand::prelude::*;
 use std::io::Write;
@@ -47,6 +50,53 @@ struct Particle {
     velocity: Vec3,
 }
 
+/// Chunk coordinate system
+#[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Default)]
+struct ChunkCoordinate {
+    x: i32,
+    z: i32,
+}
+
+impl ChunkCoordinate {
+    fn from_world_pos(pos: Vec3) -> Self {
+        Self {
+            x: (pos.x / CHUNK_SIZE).floor() as i32,
+            z: (pos.z / CHUNK_SIZE).floor() as i32,
+        }
+    }
+
+    fn world_position(&self) -> Vec3 {
+        Vec3::new(
+            self.x as f32 * CHUNK_SIZE,
+            0.0,
+            self.z as f32 * CHUNK_SIZE,
+        )
+    }
+}
+
+#[derive(Component)]
+struct ChunkEntity; // Tag for entities that belong to chunks
+
+#[derive(Resource, Default)]
+struct ChunkManager {
+    loaded_chunks: std::collections::HashMap<ChunkCoordinate, Entity>,
+    last_player_chunk: ChunkCoordinate,
+}
+
+// Constants
+const CHUNK_SIZE: f32 = 1000.0; // 1km x 1km chunks
+const LOAD_RADIUS_CHUNKS: i32 = 8; // Load chunks within 8km (fixes ground holes)
+const UNLOAD_RADIUS_CHUNKS: i32 = 12; // Unload chunks beyond 12km
+
+#[derive(Component)]
+struct Tree;
+
+#[derive(Component)]
+struct LODLevel(u8); // 0=full detail, 1=medium, 2=low, 3=billboard
+
+const TREES_PER_CHUNK_MIN: usize = 5;  // REDUCED (was 10)
+const TREES_PER_CHUNK_MAX: usize = 10; // REDUCED (was 50)
+
 /// Marker component for meteors
 #[derive(Component)]
 struct Meteor;
@@ -76,6 +126,18 @@ struct VillageRoad;
 /// Marker for village decorations (fences, hedges, etc)
 #[derive(Component)]
 struct VillageDecoration;
+
+/// Marker component for cloud entities
+#[derive(Component)]
+struct Cloud;
+
+/// Marker component for the sky sphere
+#[derive(Component)]
+struct SkySphere;
+
+/// Marker component for the infinite horizon disk
+#[derive(Component)]
+struct HorizonDisk;
 
 /// Resource to store sound handles
 #[derive(Resource)]
@@ -118,6 +180,20 @@ struct WarningSound;
 /// Allowing us to rotate the model (e.g. for banking) without affecting physics
 #[derive(Component)]
 struct ModelContainer;
+
+/// Rocket mode state (Space travel)
+#[derive(Component)]
+struct RocketMode {
+    enabled: bool,
+}
+
+impl Default for RocketMode {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
+const ROCKET_THRUST_MULTIPLIER: f32 = 8.0;
 
 /// Stores current player input state
 #[derive(Component)]
@@ -392,33 +468,47 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(PhysicsPlugins::default())
-        .insert_resource(ClearColor(Color::srgb(0.05, 0.05, 0.1))) // Darker space color
+        .insert_resource(ClearColor(Color::srgb(0.5, 0.6, 0.8))) // Skybox match
+        .insert_resource(DirectionalLightShadowMap { size: 4096 }) // High-res shadows from Bevy example
         .init_resource::<F16AeroData>() // Load Aero Data
         .init_resource::<SoundAssets>() // NEW: Load Sounds
+        .init_resource::<ChunkManager>() // NEW: Chunk Manager
         .add_systems(Startup, setup_scene)
-        .add_systems(Startup, spawn_village) // NEW: Spawn Angerdorf village
+        // .add_systems(Startup, spawn_village) // REMOVED: Replaced by chunk system
+        .add_systems(Startup, spawn_realistic_clouds) // NEW: Spawn realistic clouds
         .add_systems(Startup, spawn_meteors) // NEW: Spawn obstacles
         .add_systems(Startup, spawn_objectives) // NEW: Spawn targets
         .add_systems(Startup, spawn_turrets) // NEW: Spawn enemies
         .add_systems(Startup, spawn_player)
-        .add_systems(PreUpdate, check_ground_collision) // Before physics so AABB never sees invalid state
+        .add_systems(PreUpdate, (
+            safety_check_nan, // NEW: Global NaN protection
+            check_ground_collision, // Before physics so AABB never sees invalid state
+        ))
         // Bevy has a 20-system tuple limit per add_systems; split to avoid overflow when adding more
         .add_systems(Update, (
             read_player_input,
             arcade_flight_physics, // ARCADE PHYSICS: Direct control, no FBW interference
             update_turrets, // NEW: Turret AI
             update_engine_audio, // NEW: Dynamic engine sound
+            manage_chunks, // NEW: Infinite world chunk system
+            update_altitude_visuals, // NEW: Sky->Space transition
+            propagate_no_frustum_culling, // FIX: Ensure children don't get culled if parent is NoFrustumCulling
             debug_flight_diagnostics, // New diagnostics system
             spawn_afterburner_particles, // Particle spawning based on throttle
             update_particles, // Update particle positions and fade
+            update_cloud_billboards, // NEW: Make clouds face camera
+            update_sky_sphere, // NEW: Keep sky sphere centered on camera
+            update_horizon_disk, // NEW: Keep horizon disk centered on camera (XZ)
             update_flight_camera,
             debug_flight_data,
             debug_flight_dynamics, // Detailed rotation/rate monitoring
         ))
+        .add_systems(PostUpdate, update_lod_levels) // MOVED to PostUpdate so trees are spawned before LOD processes them
         .add_systems(Update, (
             handle_quit,
             handle_restart, // R button to restart game
             debug_asset_loading, // Debug model loading
+            debug_tree_hierarchy, // NEW: Check if scene children are spawning
             handle_shooting_input,
             update_projectiles,
             handle_projectile_collisions,
@@ -434,37 +524,77 @@ fn main() {
 
 fn setup_scene(
     mut commands: Commands,
+    asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    // Load HDR Environment Map (now used for Sky Sphere)
+    let skybox_handle = asset_server.load("textures/citrus_orchard_road_puresky_4k.hdr");
+
     commands.spawn((
         DirectionalLight {
             illuminance: 30000.0,
             shadows_enabled: true,
             ..default()
         },
+        // Tuned shadow config for Flight Sim scale (large distances)
+        // Default is too small (optimized for indoor scenes), causing shadows to disappear when flying high
+        CascadeShadowConfigBuilder {
+            num_cascades: 4,
+            minimum_distance: 0.1,
+            maximum_distance: 1000.0, // Render shadows up to 1km away
+            first_cascade_far_bound: 50.0, // High quality shadows near plane
+            overlap_proportion: 0.2,
+        }
+        .build(),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, 0.5, 0.0)),
         GlobalTransform::default(),
     ));
 
-    // Grid ground for visual reference
-    let ground_size = 10000.0; // Bigger ground for fast flight
-
-    // Create checkerboard material (alternating colors for grid effect)
-    let ground_mesh = meshes.add(Mesh::from(Plane3d::default().mesh().size(ground_size, ground_size)));
-    let checkerboard_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.2, 0.6, 0.2),  // Medium green
-        ..default()
+    // Restore AmbientLight (so scene isn't black)
+    commands.insert_resource(AmbientLight {
+        color: Color::WHITE,
+        brightness: 200.0,
     });
 
+    // Spawn Sky Sphere
+    // This creates a massive sphere around the player with the HDR texture applied to the inside
     commands.spawn((
-        Mesh3d(ground_mesh),
-        MeshMaterial3d(checkerboard_material),
-        Transform::from_xyz(0.0, -1.0, 0.0),
+        SkySphere,
+        Mesh3d(meshes.add(Mesh::from(Sphere::new(20000.0)))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color_texture: Some(skybox_handle.clone()),
+            base_color: Color::srgba(0.5, 0.6, 0.8, 1.0), // Tint to match fog
+            unlit: true, // Sky should glow, not be lit by sun
+            fog_enabled: false, // Don't let fog hide the sky
+            cull_mode: None, // Render both sides (so we see it from inside)
+            ..default()
+        })),
+        Transform::from_scale(Vec3::new(1.0, 1.0, -1.0)), // Invert sphere to show texture inside
         GlobalTransform::default(),
-        RigidBody::Static,
-        Collider::cuboid(ground_size / 2.0, 0.5, ground_size / 2.0),
     ));
+
+    // Spawn Infinite Horizon Disk (The "World Floor")
+    // This fills the gap between loaded chunks and the sky
+    commands.spawn((
+        HorizonDisk,
+        Mesh3d(meshes.add(Mesh::from(Circle::new(40000.0)))), // 40km radius circle
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgba(0.5, 0.6, 0.8, 1.0), // EXACT match to fog color
+            unlit: true, // Unlit so it doesn't get shadowed
+            fog_enabled: false, // Don't let fog affect it (it IS the fog color)
+            ..default()
+        })),
+        // Y = -2.0 ensures it's just below the ground chunks (Y=0 or -1) but above the void
+        Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
+            .with_translation(Vec3::new(0.0, -2.0, 0.0)), 
+        GlobalTransform::default(),
+        Visibility::default(),
+        InheritedVisibility::default(),
+    ));
+
+    // GLOBAL GROUND REMOVED - Replaced by Chunk System
+    // Ground is now spawned dynamically in chunks around the player.
 
     // Add a debug grid plane high above to show altitude/pitch reference
     let debug_grid_size = 20000.0;
@@ -514,13 +644,19 @@ fn setup_scene(
     }
 
     // Bevy 0.15: use DistanceFog (FogSettings was renamed/deprecated)
+    // FIX: Synced fog with chunk load distance to hide edges
+    // Chunks load up to 8000m. Fog must be opaque before then.
     commands.spawn((
         Camera3d::default(),
+        Projection::Perspective(PerspectiveProjection {
+            far: 50000.0,  // Increased to safely cover horizon disk (40km)
+            ..default()
+        }),
         DistanceFog {
-            color: Color::srgba(0.05, 0.05, 0.1, 1.0), // Match space feel
+            color: Color::srgba(0.5, 0.6, 0.8, 1.0), // Match skybox/ClearColor
             falloff: FogFalloff::Linear {
-                start: 5000.0,
-                end: 10000.0,
+                start: 5000.0, // Start fading sooner
+                end: 7500.0,   // Opaque BEFORE chunk edge (8000m)
             },
             ..default()
         },
@@ -529,99 +665,369 @@ fn setup_scene(
     ));
 }
 
-/// NEW: Spawn Angerdorf-style village (buildings arranged around central plaza)
-/// This is a historically accurate medieval village layout with:
-/// - Central green plaza
-/// - Buildings arranged in a circle around the plaza
-/// - Roads connecting buildings
-/// - Decorative elements (fences, hedges)
-fn spawn_village(
+fn manage_chunks(
     mut commands: Commands,
+    player_query: Query<&Transform, With<PlayerPlane>>,
+    mut chunk_manager: ResMut<ChunkManager>,
+    chunk_entities: Query<(Entity, &ChunkCoordinate), With<ChunkEntity>>,
     asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // Village center position
-    const VILLAGE_CENTER_X: f32 = -2000.0;  // Offset from player spawn
-    const VILLAGE_CENTER_Z: f32 = -2000.0;
-    const VILLAGE_CENTER_Y: f32 = -0.5;    // At ground level
+    let Ok(player_transform) = player_query.get_single() else {
+        eprintln!("❌ manage_chunks: NO PLAYER FOUND");
+        return;
+    };
+    let player_chunk = ChunkCoordinate::from_world_pos(player_transform.translation);
 
-    // Plaza dimensions
-    const PLAZA_RADIUS: f32 = 150.0;  // Central green area
-    const BUILDING_DISTANCE: f32 = 300.0;  // Distance from plaza center to buildings
+    // Only update if player moved to new chunk or if this is the first run
+    if player_chunk == chunk_manager.last_player_chunk && !chunk_manager.loaded_chunks.is_empty() {
+        return;
+    }
+    chunk_manager.last_player_chunk = player_chunk;
 
-    // Building arrangement in circle (Angerdorf layout)
-    const NUM_BUILDINGS: usize = 8;  // 8 buildings around plaza
+    // DEBUG: Show chunk loading progress
+    println!("📦 CHUNKS: Player at world({:.0},{:.0},{:.0}) = chunk({},{}), Loaded: {} chunks",
+        player_transform.translation.x, player_transform.translation.y, player_transform.translation.z,
+        player_chunk.x, player_chunk.z, chunk_manager.loaded_chunks.len());
 
-    // Simple building components to use
-    let wall_models = vec![
-        "fantasy_town/wall.glb#Scene0",
-        "fantasy_town/wall-wooden.glb#Scene0",
+    // 1. Unload distant chunks
+    let mut to_unload = Vec::new();
+    for (entity, chunk_coord) in &chunk_entities {
+        let dx = player_chunk.x - chunk_coord.x;
+        let dz = player_chunk.z - chunk_coord.z;
+        if dx * dx + dz * dz > UNLOAD_RADIUS_CHUNKS * UNLOAD_RADIUS_CHUNKS {
+            to_unload.push(*chunk_coord);
+            commands.entity(entity).despawn_recursive();
+        }
+    }
+
+    for coord in to_unload {
+        chunk_manager.loaded_chunks.remove(&coord);
+    }
+
+    // 2. Load nearby chunks
+    for x_offset in -LOAD_RADIUS_CHUNKS..=LOAD_RADIUS_CHUNKS {
+        for z_offset in -LOAD_RADIUS_CHUNKS..=LOAD_RADIUS_CHUNKS {
+            let chunk_coord = ChunkCoordinate {
+                x: player_chunk.x + x_offset,
+                z: player_chunk.z + z_offset,
+            };
+
+            if chunk_manager.loaded_chunks.contains_key(&chunk_coord) {
+                continue;
+            }
+            
+            let dx = x_offset;
+            let dz = z_offset;
+            if dx * dx + dz * dz > LOAD_RADIUS_CHUNKS * LOAD_RADIUS_CHUNKS {
+                continue;
+            }
+
+            let chunk_entity = spawn_chunk(
+                &mut commands,
+                &asset_server,
+                &mut meshes,
+                &mut materials,
+                chunk_coord,
+            );
+            chunk_manager.loaded_chunks.insert(chunk_coord, chunk_entity);
+        }
+    }
+}
+
+fn update_altitude_visuals(
+    player_query: Query<&Transform, With<PlayerPlane>>,
+    mut fog_query: Query<&mut DistanceFog, With<Camera3d>>,
+    mut clear_color: ResMut<ClearColor>,
+) {
+    let Ok(player_transform) = player_query.get_single() else { return };
+    let altitude = player_transform.translation.y;
+
+    // Transition zone: 15km - 25km
+    const TRANSITION_START: f32 = 15000.0;
+    const TRANSITION_END: f32 = 25000.0;
+
+    // Calculate transition factor (0.0 at 15km, 1.0 at 25km)
+    let transition_factor = ((altitude - TRANSITION_START) / (TRANSITION_END - TRANSITION_START)).clamp(0.0, 1.0);
+    
+    // Smooth ease-in-out curve
+    let t = transition_factor * transition_factor * (3.0 - 2.0 * transition_factor);
+
+    // Interpolate colors (Earth dark blue -> Space black)
+    let new_color = Color::srgb(
+        0.05 * (1.0 - t), 
+        0.05 * (1.0 - t), 
+        0.1 * (1.0 - t),
+    );
+
+    // Update background color
+    clear_color.0 = new_color;
+
+    // Update fog color
+    if let Ok(mut fog) = fog_query.get_single_mut() {
+        fog.color = new_color;
+        
+        // Increase fog distance in space (less atmosphere)
+        let fog_start = 5000.0 + (15000.0 * t); // 5km -> 20km
+        let fog_end = 10000.0 + (40000.0 * t); // 10km -> 50km
+        
+        fog.falloff = FogFalloff::Linear {
+            start: fog_start,
+            end: fog_end,
+        };
+    }
+}
+
+fn update_lod_levels(
+    player_query: Query<&Transform, With<PlayerPlane>>,
+    mut tree_query: Query<(&GlobalTransform, &mut Visibility), With<Tree>>,
+) {
+    let Ok(player_transform) = player_query.get_single() else { return };
+    let player_pos = player_transform.translation;
+
+    // Very simple LOD: Hide trees beyond 20km to save on draw calls
+    const HIDE_DISTANCE_SQ: f32 = 20000.0 * 20000.0;
+
+    let mut visible_count = 0;
+    let mut hidden_count = 0;
+
+    for (tree_global_transform, mut visibility) in &mut tree_query {
+        let dist_sq = player_pos.distance_squared(tree_global_transform.translation());
+        if dist_sq > HIDE_DISTANCE_SQ {
+            if *visibility != Visibility::Hidden {
+                *visibility = Visibility::Hidden;
+            }
+            hidden_count += 1;
+        } else {
+            if *visibility != Visibility::Inherited {
+                *visibility = Visibility::Inherited;
+            }
+            visible_count += 1;
+        }
+    }
+
+    if visible_count > 0 || hidden_count > 0 {
+        // Reduced logging frequency or removed for performance
+        // eprintln!("📊 LOD: {} visible trees, {} hidden trees", visible_count, hidden_count);
+    }
+}
+
+fn spawn_chunk(
+    commands: &mut Commands,
+    asset_server: &AssetServer,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    chunk_coord: ChunkCoordinate,
+) -> Entity {
+    let chunk_pos = chunk_coord.world_position();
+    println!("🌍 CHUNK SPAWN: coord=({},{}), world_pos=({:.0},{:.0},{:.0})",
+        chunk_coord.x, chunk_coord.z, chunk_pos.x, chunk_pos.y, chunk_pos.z);
+
+    let chunk_entity = commands.spawn((
+        ChunkEntity,
+        chunk_coord,
+        Transform::from_translation(chunk_pos),
+        GlobalTransform::default(),
+        Visibility::default(),
+        InheritedVisibility::default(),
+    )).id();
+
+    let ground_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.25, 0.3, 0.25),
+        perceptual_roughness: 0.95,
+        ..default()
+    });
+
+    commands.entity(chunk_entity).with_children(|parent| {
+        parent.spawn((
+            ChunkEntity,
+            chunk_coord,
+            Mesh3d(meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(CHUNK_SIZE)))),
+            MeshMaterial3d(ground_material),
+            Transform::from_xyz(0.0, -1.0, 0.0),
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+            RigidBody::Static,
+            Collider::cuboid(CHUNK_SIZE / 2.0, 0.5, CHUNK_SIZE / 2.0),
+        ));
+    });
+
+    spawn_trees_in_chunk(commands, asset_server, meshes, materials, chunk_coord, chunk_pos, chunk_entity);
+
+    if should_spawn_village(chunk_coord) {
+        spawn_village_in_chunk(commands, asset_server, chunk_coord, chunk_pos, chunk_entity);
+    }
+
+    println!("🌍 Chunk ({},{}) spawned with trees & village check", chunk_coord.x, chunk_coord.z);
+    chunk_entity
+}
+
+fn propagate_no_frustum_culling(
+    mut commands: Commands,
+    trees: Query<Entity, (With<Tree>, With<bevy::render::view::NoFrustumCulling>)>,
+    children_query: Query<&Children>,
+    no_culling_query: Query<Entity, With<bevy::render::view::NoFrustumCulling>>,
+) {
+    for tree_entity in &trees {
+        for child in children_query.iter_descendants(tree_entity) {
+            if !no_culling_query.contains(child) {
+                commands.entity(child).insert(bevy::render::view::NoFrustumCulling);
+            }
+        }
+    }
+}
+
+fn spawn_trees_in_chunk(
+    commands: &mut Commands,
+    asset_server: &AssetServer,
+    _meshes: &mut Assets<Mesh>,
+    _materials: &mut Assets<StandardMaterial>,
+    chunk_coord: ChunkCoordinate,
+    _chunk_pos: Vec3,
+    chunk_entity: Entity,
+) {
+    eprintln!("🌲 SPAWN_TREES_IN_CHUNK CALLED for chunk ({},{})", chunk_coord.x, chunk_coord.z);
+    use rand::SeedableRng;
+    let seed = ((chunk_coord.x as i64 * 73856093) ^ (chunk_coord.z as i64 * 19349663)) as u64;
+    let mut chunk_rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+    let tree_count = chunk_rng.gen_range(TREES_PER_CHUNK_MIN..=TREES_PER_CHUNK_MAX);
+    println!("🌲 Spawning {} trees in chunk ({},{})", tree_count, chunk_coord.x, chunk_coord.z);
+
+    let tree_models = vec![
+        "fantasy_town/tree.glb",
+        "fantasy_town/tree-crooked.glb",
+        "fantasy_town/tree-high.glb",
+        "fantasy_town/tree-high-crooked.glb",
+        "fantasy_town/tree-high-round.glb",
     ];
 
-    let roof_models = vec![
-        "fantasy_town/roof-gable.glb#Scene0",
-        "fantasy_town/roof-flat.glb#Scene0",
-    ];
+    commands.entity(chunk_entity).with_children(|parent| {
+        for _ in 0..tree_count {
+            let x = chunk_rng.gen_range(-CHUNK_SIZE/2.0..CHUNK_SIZE/2.0);
+            let z = chunk_rng.gen_range(-CHUNK_SIZE/2.0..CHUNK_SIZE/2.0);
 
-    let door_models = vec![
-        "fantasy_town/wall-door.glb#Scene0",
-        "fantasy_town/wall-wood-door.glb#Scene0",
-    ];
+            if should_spawn_village(chunk_coord) && (x*x + z*z < 400.0*400.0) {
+                 continue;
+            }
 
-    let decoration_models = vec![
-        "fantasy_town/fence.glb#Scene0",
-        "fantasy_town/hedge.glb#Scene0",
-        "fantasy_town/lantern.glb#Scene0",
-    ];
+            let model_index = chunk_rng.gen_range(0..tree_models.len());
+            let tree_model = tree_models[model_index];
+            let scale = chunk_rng.gen_range(3.0..6.0);
 
-    // Spawn buildings around plaza in circular arrangement
+            // Use LOCAL coordinates because trees are now children of the chunk
+            let tree_local_pos = Vec3::new(x, 0.0, z); // FIX: Place at ground level (Y=0)
+
+            parent.spawn((
+                Tree,
+                ChunkEntity,
+                chunk_coord,
+                LODLevel(0),
+                SceneRoot(asset_server.load(tree_model)),
+                Transform {
+                    translation: tree_local_pos,
+                    rotation: Quat::from_rotation_y(chunk_rng.gen_range(0.0..std::f32::consts::TAU)),
+                    scale: Vec3::splat(scale),
+                },
+                Visibility::default(),
+                bevy::render::view::NoFrustumCulling,
+            ));
+        }
+    });
+}
+
+/// Global safety system to prevent NaN values from crashing the physics engine
+fn safety_check_nan(
+    mut query: Query<(Entity, &mut Transform, Option<&mut LinearVelocity>, Option<&mut AngularVelocity>)>,
+) {
+    for (entity, mut transform, mut opt_lin_vel, mut opt_ang_vel) in &mut query {
+        let mut needs_reset = false;
+        
+        if transform.translation.is_nan() || transform.rotation.is_nan() || transform.scale.is_nan() {
+            needs_reset = true;
+            eprintln!("⚠️ SAFETY: Detected NaN in Transform for entity {:?}.", entity);
+        }
+        
+        if let Some(ref lin_vel) = opt_lin_vel {
+            if lin_vel.is_nan() {
+                needs_reset = true;
+                eprintln!("⚠️ SAFETY: Detected NaN in LinearVelocity for entity {:?}.", entity);
+            }
+        }
+
+        if let Some(ref ang_vel) = opt_ang_vel {
+            if ang_vel.is_nan() {
+                needs_reset = true;
+                eprintln!("⚠️ SAFETY: Detected NaN in AngularVelocity for entity {:?}.", entity);
+            }
+        }
+
+        if needs_reset {
+            transform.translation = Vec3::ZERO;
+            transform.rotation = Quat::IDENTITY;
+            transform.scale = Vec3::ONE;
+            
+            if let Some(ref mut lin_vel) = opt_lin_vel {
+                **lin_vel = LinearVelocity::ZERO;
+            }
+            if let Some(ref mut ang_vel) = opt_ang_vel {
+                **ang_vel = AngularVelocity::ZERO;
+            }
+        }
+    }
+}
+
+fn should_spawn_village(chunk_coord: ChunkCoordinate) -> bool {
+    let hash = ((chunk_coord.x.wrapping_mul(73856093)) ^ (chunk_coord.z.wrapping_mul(19349663))) as u32;
+    (hash % 100) < 5
+}
+
+fn spawn_village_in_chunk(
+    commands: &mut Commands,
+    asset_server: &AssetServer,
+    chunk_coord: ChunkCoordinate,
+    chunk_pos: Vec3,
+    _chunk_entity: Entity,
+) {
+    println!("🏘️  Spawning village in chunk ({},{})", chunk_coord.x, chunk_coord.z);
+    let village_center = chunk_pos;
+    const NUM_BUILDINGS: usize = 8;
+    const BUILDING_DISTANCE: f32 = 150.0;
+
     for i in 0..NUM_BUILDINGS {
         let angle = (i as f32 / NUM_BUILDINGS as f32) * std::f32::consts::TAU;
-
-        // Position building at distance from plaza center
-        let building_x = VILLAGE_CENTER_X + angle.cos() * BUILDING_DISTANCE;
-        let building_z = VILLAGE_CENTER_Z + angle.sin() * BUILDING_DISTANCE;
-        let building_y = VILLAGE_CENTER_Y;
-
-        // Rotate building to face plaza (center)
+        let building_x = village_center.x + angle.cos() * BUILDING_DISTANCE;
+        let building_z = village_center.z + angle.sin() * BUILDING_DISTANCE;
         let rotation = Quat::from_rotation_y(angle + std::f32::consts::PI);
 
-        // Build a simple house using wall + roof
-        // Main structure: wall + roof
         commands.spawn((
             VillageBuilding,
-            SceneRoot(asset_server.load("fantasy_town/wall.glb#Scene0")),
+            ChunkEntity,
+            chunk_coord,
+            SceneRoot(asset_server.load("fantasy_town/wall.glb")),
             Transform {
-                translation: Vec3::new(building_x, building_y, building_z),
+                translation: Vec3::new(building_x, -0.5, building_z),
                 rotation,
-                scale: Vec3::splat(3.0),  // Scale up for visibility
+                scale: Vec3::splat(6.0),
             },
             GlobalTransform::default(),
             Visibility::default(),
             InheritedVisibility::default(),
+            RigidBody::Static,
+            Collider::cuboid(3.0, 5.0, 3.0), // Building collider
         ));
 
-        // Add roof on top
         commands.spawn((
             VillageBuilding,
-            SceneRoot(asset_server.load("fantasy_town/roof-gable.glb#Scene0")),
+            ChunkEntity,
+            chunk_coord,
+            SceneRoot(asset_server.load("fantasy_town/roof-gable.glb")),
             Transform {
-                translation: Vec3::new(building_x, building_y + 3.0, building_z),
+                translation: Vec3::new(building_x, 5.5, building_z),
                 rotation,
-                scale: Vec3::splat(3.0),
-            },
-            GlobalTransform::default(),
-            Visibility::default(),
-            InheritedVisibility::default(),
-        ));
-
-        // Add door
-        commands.spawn((
-            VillageBuilding,
-            SceneRoot(asset_server.load("fantasy_town/wall-door.glb#Scene0")),
-            Transform {
-                translation: Vec3::new(building_x, building_y, building_z),
-                rotation,
-                scale: Vec3::splat(2.5),
+                scale: Vec3::splat(6.0),
             },
             GlobalTransform::default(),
             Visibility::default(),
@@ -629,37 +1035,127 @@ fn spawn_village(
         ));
     }
 
-    // Spawn decorative elements around village
-    for i in 0..NUM_BUILDINGS {
-        let angle = (i as f32 / NUM_BUILDINGS as f32) * std::f32::consts::TAU + (std::f32::consts::PI / NUM_BUILDINGS as f32);
-
-        // Fences between buildings
-        let fence_x = VILLAGE_CENTER_X + angle.cos() * (BUILDING_DISTANCE - 50.0);
-        let fence_z = VILLAGE_CENTER_Z + angle.sin() * (BUILDING_DISTANCE - 50.0);
-
-        commands.spawn((
-            VillageDecoration,
-            SceneRoot(asset_server.load("fantasy_town/fence.glb#Scene0")),
-            Transform {
-                translation: Vec3::new(fence_x, VILLAGE_CENTER_Y, fence_z),
-                rotation: Quat::from_rotation_y(angle),
-                scale: Vec3::splat(2.0),
-            },
-            GlobalTransform::default(),
-            Visibility::default(),
-            InheritedVisibility::default(),
-        ));
-    }
-
-    // Spawn central plaza marker (green area) - use a simple plane
-    let plaza_radius = PLAZA_RADIUS;
     commands.spawn((
-        VillageRoad,
-        Transform::from_xyz(VILLAGE_CENTER_X, VILLAGE_CENTER_Y - 0.1, VILLAGE_CENTER_Z),
+        VillageBuilding,
+        ChunkEntity,
+        chunk_coord,
+        SceneRoot(asset_server.load("fantasy_town/wall.glb")),
+        Transform {
+            translation: village_center,
+            rotation: Quat::IDENTITY,
+            scale: Vec3::splat(20.0),
+        },
         GlobalTransform::default(),
+        Visibility::default(),
+        InheritedVisibility::default(),
+        RigidBody::Static,
+        Collider::cuboid(10.0, 20.0, 10.0), // Tower collider
     ));
+}
 
-    println!("🏘️  Village spawned - Angerdorf layout with {} buildings around central plaza", NUM_BUILDINGS);
+/// Spawn realistic cloud layer using FX cloud alpha textures
+fn spawn_realistic_clouds(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let mut rng = rand::thread_rng();
+
+    // Load all 10 cloud textures
+    let cloud_textures = vec![
+        "textures/clouds/FX_CloudAlpha01.png",
+        "textures/clouds/FX_CloudAlpha02.png",
+        "textures/clouds/FX_CloudAlpha03.png",
+        "textures/clouds/FX_CloudAlpha04.png",
+        "textures/clouds/FX_CloudAlpha05.png",
+        "textures/clouds/FX_CloudAlpha06.png",
+        "textures/clouds/FX_CloudAlpha07.png",
+        "textures/clouds/FX_CloudAlpha08.png",
+        "textures/clouds/FX_CloudAlpha09.png",
+        "textures/clouds/FX_CloudAlpha10.png",
+    ];
+
+    // Cloud layer configuration
+    const CLOUD_COUNT: usize = 50;
+    const CLOUD_ALTITUDE_MIN: f32 = 800.0;
+    const CLOUD_ALTITUDE_MAX: f32 = 1500.0;
+    const CLOUD_SPREAD: f32 = 40000.0;
+
+    for _ in 0..CLOUD_COUNT {
+        let x = rng.gen_range(-CLOUD_SPREAD..CLOUD_SPREAD);
+        let y = rng.gen_range(CLOUD_ALTITUDE_MIN..CLOUD_ALTITUDE_MAX);
+        let z = rng.gen_range(-CLOUD_SPREAD..CLOUD_SPREAD);
+
+        let texture_index = rng.gen_range(0..cloud_textures.len());
+        let texture_path = cloud_textures[texture_index];
+
+        let base_size = 150.0;
+        let size = base_size + rng.gen_range(-50.0..100.0);
+
+        let cloud_material = materials.add(StandardMaterial {
+            base_color_texture: Some(asset_server.load(texture_path)),
+            base_color: Color::srgba(1.0, 1.0, 1.0, 0.8),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            double_sided: true,
+            cull_mode: None,
+            ..default()
+        });
+
+        let cloud_mesh = meshes.add(Mesh::from(Rectangle::new(size, size * 0.7)));
+
+        commands.spawn((
+            Cloud,
+            Mesh3d(cloud_mesh),
+            MeshMaterial3d(cloud_material),
+            Transform::from_xyz(x, y, z)
+                .with_rotation(Quat::from_rotation_y(rng.gen_range(0.0..std::f32::consts::TAU))),
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+        ));
+    }
+
+    println!("☁️  Realistic cloud layer spawned - {} clouds at 800-1500m altitude", CLOUD_COUNT);
+}
+
+/// Update clouds to face camera (billboarding)
+fn update_cloud_billboards(
+    mut cloud_query: Query<&mut Transform, (With<Cloud>, Without<Camera3d>)>,
+    camera_query: Query<&Transform, (With<Camera3d>, Without<Cloud>)>,
+) {
+    if let Ok(camera_transform) = camera_query.get_single() {
+        for mut cloud_transform in &mut cloud_query {
+            cloud_transform.look_at(camera_transform.translation, Vec3::Y);
+        }
+    }
+}
+
+/// Keep the sky sphere centered on the camera to create an infinite sky effect
+fn update_sky_sphere(
+    mut sky_sphere_query: Query<&mut Transform, With<SkySphere>>,
+    camera_query: Query<&Transform, (With<Camera3d>, Without<SkySphere>)>,
+) {
+    if let Ok(camera_transform) = camera_query.get_single() {
+        for mut sky_transform in &mut sky_sphere_query {
+            sky_transform.translation = camera_transform.translation;
+        }
+    }
+}
+
+/// Keep the horizon disk centered on the camera (XZ only)
+fn update_horizon_disk(
+    mut horizon_query: Query<&mut Transform, With<HorizonDisk>>,
+    camera_query: Query<&Transform, (With<Camera3d>, Without<HorizonDisk>)>,
+) {
+    if let Ok(camera_transform) = camera_query.get_single() {
+        for mut transform in &mut horizon_query {
+            transform.translation.x = camera_transform.translation.x;
+            transform.translation.z = camera_transform.translation.z;
+            // Y remains fixed at -5.0
+        }
+    }
 }
 
 /// NEW: Spawn random meteor obstacles in the sky
@@ -684,8 +1180,8 @@ fn spawn_meteors(
     // Volume configuration
     const METEOR_COUNT: usize = 100;
     const RANGE_XZ: f32 = 2500.0;
-    const RANGE_Y_MIN: f32 = 50.0;
-    const RANGE_Y_MAX: f32 = 1200.0;
+    const RANGE_Y_MIN: f32 = 200.0;  // Keep meteors well above ground
+    const RANGE_Y_MAX: f32 = 2000.0; // Extend upward for more vertical space
     const PLAYER_SAFE_ZONE: f32 = 100.0; // Don't spawn within 100m of (0, 500, 0)
 
     for i in 0..METEOR_COUNT {
@@ -914,6 +1410,7 @@ fn spawn_player(
     .insert(DiagnosticTimer(Timer::from_seconds(0.5, TimerMode::Repeating)))
     .insert(AfterburnerParticles::default())
     .insert(LastShotTime::default())
+    .insert(RocketMode::default())
     .id();
 
     commands.entity(player)
@@ -968,9 +1465,15 @@ fn spawn_player(
 
 fn read_player_input(
     keyboard_input: Res<ButtonInput<KeyCode>>,
-    mut player_query: Query<(&mut PlayerInput, &AngularVelocity, &Transform, &mut FlightControlComputer), With<PlayerPlane>>,
+    mut player_query: Query<(&mut PlayerInput, &AngularVelocity, &Transform, &mut FlightControlComputer, &mut RocketMode), With<PlayerPlane>>,
 ) {
-    for (mut input, _ang_vel, _transform, mut fbw) in &mut player_query {
+    for (mut input, _ang_vel, _transform, mut fbw, mut rocket_mode) in &mut player_query {
+        // Toggle Rocket Mode with R key
+        if keyboard_input.just_pressed(KeyCode::KeyR) {
+            rocket_mode.enabled = !rocket_mode.enabled;
+            println!("🚀 ROCKET MODE: {}", if rocket_mode.enabled { "ENABLED" } else { "DISABLED" });
+        }
+
         // Toggle SAS with K key (for legacy FBW, not used with arcade physics)
         if keyboard_input.just_pressed(KeyCode::KeyK) {
             fbw.sas_enabled = !fbw.sas_enabled;
@@ -1333,6 +1836,7 @@ fn arcade_flight_physics(
             &LinearVelocity,
             &mut AngularVelocity,
             &mut ExternalForce,
+            &RocketMode,
         ),
         With<PlayerPlane>,
     >,
@@ -1347,7 +1851,7 @@ fn arcade_flight_physics(
     const BOOST_MULTIPLIER: f32 = 3.5;
     const BOOST_THRESHOLD: f32 = 0.8;
 
-    for (input, transform, velocity, mut ang_vel, mut ext_force) in &mut player_query {
+    for (input, transform, velocity, mut ang_vel, mut ext_force, rocket_mode) in &mut player_query {
         ext_force.clear();
 
         // ===== 1. LOCAL-SPACE ROTATION (Gemini's elegant approach) =====
@@ -1361,14 +1865,19 @@ fn arcade_flight_physics(
                           up * input.yaw * YAW_RATE +
                           forward * input.roll * ROLL_RATE;
 
-        // Smooth interpolation for natural feel
-        ang_vel.0 = ang_vel.0.lerp(target_omega, SMOOTHING_FACTOR);
+        // Smooth interpolation for natural feel - NaN PROTECTION
+        if !target_omega.is_nan() {
+             ang_vel.0 = ang_vel.0.lerp(target_omega, SMOOTHING_FACTOR);
+        }
 
         // ===== 2. DRAG =====
         let speed = velocity.length();
         if speed > 1.0 {
-            let drag_force = -velocity.0.normalize() * speed * speed * DRAG_COEFFICIENT;
-            ext_force.apply_force(drag_force);
+            // SAFE NORMALIZATION: Prevent division by zero if velocity is tiny
+            let drag_force = -velocity.0.normalize_or_zero() * speed * speed * DRAG_COEFFICIENT;
+            if !drag_force.is_nan() {
+                ext_force.apply_force(drag_force);
+            }
         }
 
         // ===== 3. THRUST WITH VERTICAL COMPONENT (My approach, simplified) =====
@@ -1376,14 +1885,27 @@ fn arcade_flight_physics(
         let (_, pitch_angle, _) = transform.rotation.to_euler(EulerRot::XYZ);
 
         // Decompose thrust into forward and vertical components based on pitch
-        let vertical_component = input.throttle * MAX_THRUST_NEWTONS * pitch_angle.sin();
-        let forward_component = input.throttle * MAX_THRUST_NEWTONS * pitch_angle.cos();
+        // CLAMP INPUTS to prevent runaway values
+        let safe_throttle = input.throttle.clamp(0.0, 1.0);
+        let vertical_component = safe_throttle * MAX_THRUST_NEWTONS * pitch_angle.sin();
+        let forward_component = safe_throttle * MAX_THRUST_NEWTONS * pitch_angle.cos();
 
         // Apply boost multiplier when throttle is high
-        let boost_mult = if input.throttle > BOOST_THRESHOLD { BOOST_MULTIPLIER } else { 1.0 };
+        let mut boost_mult = if safe_throttle > BOOST_THRESHOLD { BOOST_MULTIPLIER } else { 1.0 };
+        
+        // Rocket mode overrides everything with massive thrust
+        if rocket_mode.enabled {
+            boost_mult = ROCKET_THRUST_MULTIPLIER;
+        }
+        
+        // Final safety clamp on boost
+        boost_mult = boost_mult.clamp(1.0, 20.0);
 
         let thrust_force = (forward * forward_component + up * vertical_component) * boost_mult;
-        ext_force.apply_force(thrust_force);
+        
+        if !thrust_force.is_nan() {
+            ext_force.apply_force(thrust_force);
+        }
 
         // ===== 4. GRAVITY =====
         // Handled by Avian3D - no manual application needed
@@ -1605,7 +2127,7 @@ fn handle_restart(
         With<PlayerPlane>,
     >,
 ) {
-    if keyboard_input.just_pressed(KeyCode::KeyR) {
+    if keyboard_input.just_pressed(KeyCode::F5) {
         if let Ok((mut transform, mut lin_vel, mut ang_vel, mut input, mut fbw)) =
             player_query.get_single_mut()
         {
@@ -1692,7 +2214,9 @@ fn update_projectiles(
     for (entity, mut projectile) in &mut projectile_query {
         projectile.lifetime -= time.delta_secs();
         if projectile.lifetime <= 0.0 {
-            commands.entity(entity).despawn_recursive();
+            if commands.get_entity(entity).is_some() {
+                commands.entity(entity).despawn_recursive();
+            }
         }
     }
 }
@@ -1723,26 +2247,34 @@ fn handle_projectile_collisions(
                 contacts.entity1
             };
             
+            // Check if bullet still exists (prevent B0003 warning)
+            if commands.get_entity(bullet).is_none() {
+                continue;
+            }
+
             if ground_query.contains(other_entity) {
                 commands.entity(bullet).despawn_recursive();
             } else if let Ok((target_entity, target_transform)) = objective_query.get(other_entity) {
-                println!("🎯 TARGET DESTROYED!");
-                
-                let explosion_pos = target_transform.translation;
-                commands.entity(target_entity).despawn_recursive();
-                commands.entity(bullet).despawn_recursive();
-                
-                spawn_huge_explosion(&mut commands, &mut meshes, &mut materials, explosion_pos);
+                // Check if target still exists
+                if commands.get_entity(target_entity).is_some() {
+                    println!("🎯 TARGET DESTROYED!");
+                    
+                    let explosion_pos = target_transform.translation;
+                    commands.entity(target_entity).despawn_recursive();
+                    commands.entity(bullet).despawn_recursive();
+                    
+                    spawn_huge_explosion(&mut commands, &mut meshes, &mut materials, explosion_pos);
 
-                // Play explosion sound
-                commands.spawn((
-                    AudioPlayer(sounds.explosion.clone()),
-                    PlaybackSettings {
-                        mode: bevy::audio::PlaybackMode::Despawn,
-                        volume: bevy::audio::Volume::new(1.0),
-                        ..default()
-                    },
-                ));
+                    // Play explosion sound
+                    commands.spawn((
+                        AudioPlayer(sounds.explosion.clone()),
+                        PlaybackSettings {
+                            mode: bevy::audio::PlaybackMode::Despawn,
+                            volume: bevy::audio::Volume::new(1.0),
+                            ..default()
+                        },
+                    ));
+                }
             }
         }
     }
@@ -1907,6 +2439,16 @@ fn check_ground_collision(
     const SOFT_CEILING: f32 = 0.5; // Don't let physics see us below this (avoids AABB edge cases)
 
     for (_entity, mut transform, mut velocity, mut ang_vel) in &mut player_query {
+        // SAFETY FIX: Check for NaN values that crash avian3d physics
+        if transform.translation.is_nan() || transform.translation.x.is_nan() || transform.translation.y.is_nan() || transform.translation.z.is_nan()
+            || velocity.x.is_nan() || velocity.y.is_nan() || velocity.z.is_nan() {
+            eprintln!("⚠️ SAFETY: Detected NaN in player transform/velocity! Resetting to safe position.");
+            transform.translation = Vec3::new(0.0, 500.0, 0.0);
+            *velocity = LinearVelocity::ZERO;
+            *ang_vel = AngularVelocity::ZERO;
+            continue;
+        }
+
         if transform.translation.y <= GROUND_LEVEL {
             let crash_speed = velocity.length();
 
@@ -2032,7 +2574,7 @@ fn spawn_afterburner_particles(
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    player_query: Query<(&Transform, &PlayerInput), With<PlayerPlane>>,
+    player_query: Query<(&Transform, &PlayerInput, &LinearVelocity), With<PlayerPlane>>,
     emitter_query: Query<&AfterburnerParticles, With<PlayerPlane>>,
 ) {
     // #region agent log
@@ -2041,9 +2583,15 @@ fn spawn_afterburner_particles(
         debug_log("spawn_afterburner_particles", "query get_single failed", &format!(r#"{{"player_ok":{},"emitter_ok":{}}}"#, player_ok.is_ok(), emitter_ok.is_ok()), "D");
         return;
     }
-    let (player_transform, input) = player_ok.unwrap();
+    let (player_transform, input, player_velocity) = player_ok.unwrap();
     let emitter = emitter_ok.unwrap();
     // #endregion
+
+    // NaN SAFETY: Don't spawn particles if throttle is corrupted
+    if input.throttle.is_nan() {
+        return;
+    }
+
     if input.throttle < emitter.spawn_threshold {
         // #region agent log
         debug_log("spawn_afterburner_particles", "throttle below threshold", &format!(r#"{{"throttle":{},"spawn_threshold":{}}}"#, input.throttle, emitter.spawn_threshold), "A");
@@ -2065,6 +2613,7 @@ fn spawn_afterburner_particles(
     let world_pos: Vec3 = player_transform.translation
         + back * EXHAUST_DISTANCE
         - player_transform.right().as_vec3() * EXHAUST_SHIFT_LEFT;
+    
     // #region agent log
     if spawn_count > 0 {
         debug_log("spawn_afterburner_particles", "spawn world_pos", &format!(r#"{{"world_pos":[{},{},{}],"player_translation":[{},{},{}],"back":[{},{},{}]}}"#, world_pos.x, world_pos.y, world_pos.z, player_transform.translation.x, player_transform.translation.y, player_transform.translation.z, back.x, back.y, back.z), "B");
@@ -2074,14 +2623,18 @@ fn spawn_afterburner_particles(
     for _ in 0..spawn_count {
 
             let backward_velocity = player_transform.forward().as_vec3() * -20.0;
+            // Inherit 20% of player velocity for "drag" effect (smoke trail)
+            // If player is moving fast forward, particles shouldn't stop instantly
+            let inherited_velocity = player_velocity.0 * 0.2;
+
             let random_spread = Vec3::new(
                 (rand::random::<f32>() - 0.5) * 5.0,
                 (rand::random::<f32>() - 0.5) * 5.0,
                 (rand::random::<f32>() - 0.5) * 5.0,
             );
-            let velocity = backward_velocity + random_spread;
+            let velocity = backward_velocity + inherited_velocity + random_spread;
 
-            let flame_index = ((time.elapsed_secs() * 10.0) as usize) % 6 + 1;
+            let flame_index = ((time.elapsed_secs() * 15.0) as usize) % 6 + 1;
             let texture_path = format!("particles/flame_0{}.png", flame_index);
             let texture_handle = asset_server.load(&texture_path);
 
@@ -2097,7 +2650,14 @@ fn spawn_afterburner_particles(
             };
 
             let material_handle = materials.add(material);
-            let size = 0.8 + throttle_factor * 1.5; // Larger particles
+            
+            // Dynamic scaling: Boost makes flame HUGE
+            let size = if input.throttle > 0.8 {
+                2.5 + (input.throttle - 0.8) * 5.0
+            } else {
+                1.2 + input.throttle * 1.5
+            };
+            
             let quad_mesh = meshes.add(Mesh::from(Rectangle::new(size, size)));
 
             commands.spawn((
@@ -2172,4 +2732,27 @@ fn update_particles(
         debug_log("update_particles", "particle count and first", &format!(r#"{{"particle_count":{},"first_pos":[{},{},{}],"first_lifetime_remaining":{}}}"#, log_count, log_first_pos.x, log_first_pos.y, log_first_pos.z, log_first_life), "E");
     }
     // #endregion
+}
+
+/// Diagnostic system to check if Tree SceneRoot children are being spawned
+fn debug_tree_hierarchy(
+    query: Query<(Entity, &Children), With<Tree>>,
+) {
+    let mut total_trees_with_children = 0;
+    let mut total_children_count = 0;
+
+    for (entity, children) in query.iter().take(5) {
+        if children.len() > 0 {
+            total_trees_with_children += 1;
+            total_children_count += children.len();
+            eprintln!("🔍 Tree {:?} has {} children (Scene children spawned!)", entity, children.len());
+        }
+    }
+
+    if total_trees_with_children == 0 {
+        eprintln!("⚠️  DEBUG: Sampled 5 trees, NONE have children! Scene loading might be broken.");
+        eprintln!("⚠️  If this persists, try removing #Scene0 from asset paths or checking file format.");
+    } else {
+        eprintln!("✓ Trees have children - Scene loading works! (avg {} children per tree)", total_children_count / total_trees_with_children.max(1));
+    }
 }
