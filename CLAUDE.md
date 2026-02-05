@@ -3,7 +3,7 @@
 ## Project Overview
 F-16 flight simulator with infinite procedurally-generated terrain, chunk-based world loading, and arcade physics. Built with Bevy 0.15 + Avian3D physics.
 
-**Status:** Phase 1 & 2 COMPLETE - Chunk-based infinite world with 3000+ procedurally-placed trees and villages, rocket mode (8x thrust, reaches 25km in ~12 sec), sky→space transition. Currently: Testing actual .glb asset rendering (using green cube placeholders); NaN physics crash protection active.
+**Status:** Phase 1 & 2 COMPLETE - Chunk-based infinite world with 3000+ procedurally-placed trees and villages, rocket mode (8x thrust, reaches 25km in ~12 sec), seamless sky→space transition. **Rendering hardened** (Gemini session): Physics NaN protection, horizon glitch fixed (fog sync + infinite green earth disk), particles clamped, warped flame fixed. **Asset blocker remaining:** Trees/buildings still using green cube placeholders (need direct .glb mesh loading).
 
 ## User Design Goals (Multi-Session Coordination)
 
@@ -82,10 +82,28 @@ F-16 flight simulator with infinite procedurally-generated terrain, chunk-based 
   - Added to tree entities to guarantee visibility
 - **DirectionalLight** - illuminance 30000.0 with shadows enabled
 
-### Physics Safety
-- **NaN crash protection:** Check for NaN in `check_ground_collision()` before physics updates
-  - Detects invalid transform/velocity and resets player to (0, 500, 0)
-  - Prevents avian3d AABB panic crashes
+### Physics Safety (From Gemini Hardening Session)
+- **NaN crash protection (Multiple layers):**
+  - `arcade_flight_physics`: Uses `normalize_or_zero()` instead of `normalize()`, clamps throttle/boost safely
+  - `spawn_afterburner_particles`: Early return if throttle input is NaN, particle size clamped to 0.1-10.0
+  - `update_particles`: Despawns particles with NaN transforms immediately
+  - `check_ground_collision`: Hard reset if Y > 100,000 or Y < -1,000 (prevents "dark bar" glitch)
+  - **Result:** Game is stable, no physics crashes or warped flames
+
+### Rendering & Sky System (From Gemini Hardening Session)
+- **Jagged Horizon Problem SOLVED:**
+  - **Root cause:** Horizon Disk was blue (sky color) but ground chunks green, creating sharp contrast
+  - **Solution:** Infinite Earth technique - make HorizonDisk green (0.25, 0.3, 0.25) to match chunks exactly
+  - **Fog Sync:** Tightened fog to 3000m start, 6000m end (ensures 100% opacity before 8000m chunk edge)
+  - **Disk properties:** 100km radius, enabled fog, matches ground material properties
+  - **Result:** Seamless infinite-looking world with no stair-step artifacts
+- **Warped Afterburner Particle Fix:**
+  - Root cause: Particle size could reach extreme values (NaN), creating giant streaks
+  - Solution: Clamped size to 0.1-10.0 range in `spawn_afterburner_particles`
+  - Result: Clean flame effects, no visual glitches
+- **Clear Color & Fog Color Sync:**
+  - All sky/fog/horizon elements use Color::srgba(0.5, 0.6, 0.8, 1.0) consistently
+  - Creates seamless sky-to-horizon-to-ground visual continuity
 
 ## Debugging Techniques That Worked
 
@@ -134,31 +152,39 @@ F-16 flight simulator with infinite procedurally-generated terrain, chunk-based 
 
 ## Next Steps (Priority Order)
 
-1. **CRITICAL: Fix .glb asset rendering** - Currently using green cube placeholders
-   - Issue: SceneRoot doesn't spawn visible children in Bevy 0.15
-   - Solution: Load Mesh directly from glTF + apply StandardMaterial
-   - Files: Tree spawning at lines 803-870, need new asset loading code
+### Priority 1: FIX ASSET LOADING (BLOCKER) ⚠️
+**Status:** Main visual blocker - trees/buildings still rendered as green cubes
+**Problem:** SceneRoot doesn't spawn visible .glb children in Bevy 0.15
+**Solution:** Replace SceneRoot with direct Mesh loading:
+1. Load glTF Mesh directly (not SceneRoot)
+2. Apply StandardMaterial manually to each mesh
+3. Spawn as Mesh3d entity instead of SceneRoot wrapper
+4. Update in: `spawn_trees_in_chunk()` function (lines 803-870)
+5. Test with: `cargo run --release` then look for actual tree models
 
-2. **Fix physics horizon glitch** - Camera far clip or fog distance mismatch
-   - Check: Camera far clip plane vs DistanceFog end distance
-   - Reference: CLAUDE.md line 76 has camera far clip fix documented
+**Why this matters:** All other systems work (chunks, physics, rendering pipeline). Just need to swap placeholder Cuboid for real Mesh loading.
+**Estimated time:** 1-2 hours
+**Unblocks:** Actual tree/building visibility, completion of Phase 1 visual representation
 
-3. **Test complete Phase 1 & 2** - Run game and verify:
-   - Ground renders continuously without holes ✓ (8km load radius)
-   - Trees spawn and despawn properly ✓ (chunk system)
-   - Rocket mode reaches 25km in expected time ✓
-   - FPS stays 60+ ✓
+### Priority 2: Verify Phase 1 & 2 Complete
+- Run game and check:
+  - Ground continuous, no holes ✓ (8km radius working)
+  - Chunks load/unload smoothly ✓
+  - Physics stable, no crashes ✓ (NaN protection added)
+  - Horizon seamless ✓ (green disk + fog sync done)
+  - Rocket mode 25km reachable in ~12 sec ✓
+  - FPS 60+ during normal flight (untested)
 
-4. **Phase 3 Combat System** - Ready to start when user provides drone 3D models
-   - Prompts available in PHASE3_IMPLEMENTATION_PROMPTS.md
-   - Design: Swarm AI + Kamikaze AI + weapon system
-   - Effort: ~12 hours (blocked on assets)
+### Priority 3: Phase 3 Combat System
+**Blocker:** Waiting on drone 3D models from user
+**When ready:** PHASE3_IMPLEMENTATION_PROMPTS.md has full design
+**Effort:** ~12 hours once assets provided
 
-5. **Optional Polish** - After Phase 3 or if combat blocked:
-   - Add ground grid texture for speed feedback
-   - Implement proper LOD mesh variants (instead of just visibility toggle)
-   - Add building colliders to villages
-   - Improve particle effects
+### Optional Polish
+- Ground grid texture for speed feedback
+- Proper LOD mesh variants (instead of visibility toggle)
+- Building colliders in villages
+- Enhanced particle effects
 
 ## Bash Commands Useful for This Project
 
