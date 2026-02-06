@@ -3,7 +3,7 @@
 ## Project Overview
 F-16 flight simulator with infinite procedurally-generated terrain, chunk-based world loading, and arcade physics. Built with Bevy 0.15 + Avian3D physics.
 
-**Status:** Phase 1 & 2 COMPLETE - Chunk-based infinite world with 3000+ procedurally-placed trees and villages, rocket mode (8x thrust, reaches 25km in ~12 sec), seamless sky→space transition. **Rendering hardened** (Gemini session): Physics NaN protection, horizon glitch fixed (fog sync + infinite green earth disk), particles clamped, warped flame fixed. **Asset blocker remaining:** Trees/buildings still using green cube placeholders (need direct .glb mesh loading).
+**Status:** Phase 2 COMPLETE + Phase 3 STARTED - Chunk-based infinite world, rocket mode, seamless sky→space, physics hardened. **Phase 3 IN PROGRESS:** Drone combat system with advanced swarm AI (lead pursuit, obstacle avoidance, flocking), missile-drone collision detection, kamikaze mechanics working. **Known issues:** Drone .glb model not rendering (using SceneRoot workaround), JPG texture async loading bug (using procedural texture workaround).
 
 ## User Design Goals (Multi-Session Coordination)
 
@@ -17,12 +17,19 @@ F-16 flight simulator with infinite procedurally-generated terrain, chunk-based 
 - ✅ Rocket booster mode (R key toggle): 8x thrust multiplier, reaches 25km in ~12 seconds
 - ✅ Sky→space transition: Gradual color change from blue to black (15-25km range)
 
-**Phase 3+ Features (Not Yet Started):**
-- Air combat: Drones (like Ukrainian military drones) to shoot down - **BLOCKED on drone 3D models**
-- Speed counter UI: Show velocity numerically (design ready)
+**Phase 3 Features (IN PROGRESS):**
+- ✅ Drone spawning: 6 drones with advanced swarm AI (lead pursuit, obstacle avoidance, flocking)
+- ✅ Missile system: Fire with Space, collision detection with drones
+- ✅ Kamikaze mechanics: Drones collide at 20m proximity, explosion effects
+- ✅ Dynamic drone speed: Warp pursuit (5.0x) when player >5km away, combat mode (2.2x) when close
+- ❌ Drone 3D model rendering: Currently using SceneRoot workaround, model not visible
+- ⏳ Speed counter UI: Show velocity numerically (next task)
+
+**Phase 4+ Features (Not Yet Started):**
 - Cockpit view: Future addition (steal code from open-source plane game if available)
 - Day/night cycle: Currently always ambient lighting on
 - Ground texture/grid: Make speed visible through ground pattern
+- Building collisions: Currently villages don't block player
 
 **Design Constraints:**
 - Keep current camera system for now (3rd person view behind plane)
@@ -255,6 +262,91 @@ ffmpeg -i input.ogg -vn -c:a copy output.ogg
 
 ---
 
+## Session 2026-02-05 Learnings (Claude Session)
+
+### Fixed Issues
+1. **Physics Crash (AABB assertion)** ✅
+   - Root cause: NaN in collider dimensions (transform.scale could be zero or NaN)
+   - Solution: `detect_nan_early()` system in `FixedFirst` schedule (runs BEFORE physics)
+   - Now catches AND FIXES invalid values before physics engine sees them
+   - Added scale validation: reject scale with any dimension ≤ 0 or NaN
+
+2. **ESC Key Respawn** ✅
+   - Changed: ESC now respawns player (was quit game)
+   - F10 to quit instead
+   - Convenient for testing combat repeatedly
+
+3. **Drone Spawn Distance & Speed** ✅
+   - Moved spawn from 200m (instant death) to 1km+ away
+   - Speed reduced to 80-130 m/s to allow player reaction time
+   - Drones spawn in formations for tactical variety
+
+4. **Drone Pursuit AI** ✅
+   - Implemented: Lead pursuit (predicting player movement)
+   - Swarm behavior: separation, alignment, cohesion
+   - Obstacle avoidance (meteors)
+   - Tactical weaving for visual interest
+   - Dynamic speed multiplier (warp pursuit if >5km away)
+
+### Known Blockers (Bevy 0.15 Issues)
+1. **JPG Texture Not Rendering** ⚠️
+   - Issue: [Bevy #15081](https://github.com/bevyengine/bevy/issues/15081)
+   - Problem: Materials with async-loaded textures never update bind group after load
+   - Workaround: Use procedural textures (working but less detailed)
+   - Attempted fix: `check_grass_texture_loaded()` system with `AssetServer::get_load_state()` - doesn't fix bind group update bug
+   - Better solution: Implement `bevy_asset_loader` crate OR wait for Bevy fix
+
+2. **Drone 3D Model (.glb) Not Rendering** ⚠️
+   - File exists: `assets/models/drone.glb` (12MB)
+   - Issue: Using `SceneRoot(asset_server.load("models/drone.glb#Scene0"))`
+   - Workaround: Using visual red cube fallback mesh
+   - Root cause: Bevy 0.15 SceneRoot mesh loading complexity (known limitation)
+   - Fix attempted: Direct mesh loading with `#Mesh0/Primitive0` selector - didn't work
+   - Better approach: Confirm correct scene path with `#Scene0` or use different asset format
+
+### Code Patterns That Worked Well
+1. **NaN Detection Pattern:**
+   ```rust
+   // In FixedFirst schedule (before physics)
+   if !value.is_finite() || value <= 0.0 {
+       eprintln!("⚠️ Invalid!");
+       value = safe_default;
+   }
+   ```
+
+2. **Procedural Texture Pattern:**
+   ```rust
+   // Create texture at startup (no async issues)
+   let texture_data = vec![...];
+   let image = Image::new(extent, format, texture_data, ...);
+   image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+       address_mode_u: ImageAddressMode::Repeat,
+       address_mode_v: ImageAddressMode::Repeat,
+       ..default()
+   });
+   ```
+
+3. **Drone Query Pattern:**
+   ```rust
+   let Ok((player_transform, player_velocity)) = player_query.get_single() else { return };
+   for (entity, mut transform, drone) in &mut drone_query {
+       // Can safely access player without checking every iteration
+   }
+   ```
+
+### Testing Insights
+- Game needs 5+ minutes of flight to reveal async loading issues
+- Drones spawning close (200m) causes instant collisions - bad for testing
+- Procedural texture acceptable visual quality for now
+- Red cube drones highly visible - good for debugging AI behavior
+- 60+ FPS maintained with 6 drones + combat system
+
+### Critical Fixes to Keep
+- **NaN detection in FixedFirst** - do NOT move to Update schedule (physics runs before Update)
+- **detect_nan_early() MUST check scale** - zero/negative scale causes AABB assertion
+- **Drone spawn 1km+** - player needs time to see and react
+- **ESC respawn** - much better UX for testing
+
 ---
 
 ## AI Workflow & Maintenance
@@ -269,5 +361,6 @@ ffmpeg -i input.ogg -vn -c:a copy output.ogg
 - **Git Strategy:** Run `git commit` before major refactors as safety checkpoint
 - **Code Management:** Keep main.rs under 1500-2000 lines before splitting
 
-**Last Updated:** 2026-02-05 (File cleanup + CLAUDE.md refresh + AI workflow documentation)
-**Next Review:** Before starting asset loading fix or any major refactor
+**Last Updated:** 2026-02-05 21:30 (Physics crash fixed + Phase 3 drone AI + Bevy async issues documented + Testing patterns)
+**Next Review:** Before attempting JPG texture fix OR drone model rendering fix
+**Priority Blockers:** Bevy 0.15 async texture loading (#15081), Drone .glb model path verification
