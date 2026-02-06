@@ -18,11 +18,12 @@ F-16 flight simulator with infinite procedurally-generated terrain, chunk-based 
 - ✅ Sky→space transition: Gradual color change from blue to black (15-25km range)
 
 **Phase 3 Features (IN PROGRESS):**
-- ✅ Drone spawning: 6 drones with advanced swarm AI (lead pursuit, obstacle avoidance, flocking)
+- ✅ Drone spawning: Infinite chunk-based spawning (15% per chunk) with advanced swarm AI (lead pursuit, obstacle avoidance, flocking)
 - ✅ Missile system: Fire with Space, collision detection with drones
 - ✅ Kamikaze mechanics: Drones collide at 20m proximity, explosion effects
-- ✅ Dynamic drone speed: Warp pursuit (5.0x) when player >5km away, combat mode (2.2x) when close
-- ❌ Drone 3D model rendering: Currently using SceneRoot workaround, model not visible
+- ✅ Dynamic drone speed: Warp pursuit (5.0x) when player >5km away, sprint (3.0x) when >2km, combat (2.2x) when <1km
+- ✅ Infinite world patrol: Drones automatically despawn at 15km+ distance, new ones spawn ahead
+- ⚠️ **REGRESSION:** Drone 3D model rendering - visual fallback removed in latest work, may be invisible now
 - ⏳ Speed counter UI: Show velocity numerically (next task)
 
 **Phase 4+ Features (Not Yet Started):**
@@ -361,6 +362,67 @@ ffmpeg -i input.ogg -vn -c:a copy output.ogg
 - **Git Strategy:** Run `git commit` before major refactors as safety checkpoint
 - **Code Management:** Keep main.rs under 1500-2000 lines before splitting
 
-**Last Updated:** 2026-02-05 21:30 (Physics crash fixed + Phase 3 drone AI + Bevy async issues documented + Testing patterns)
-**Next Review:** Before attempting JPG texture fix OR drone model rendering fix
-**Priority Blockers:** Bevy 0.15 async texture loading (#15081), Drone .glb model path verification
+**Last Updated:** 2026-02-06 12:15 (Gemini: infinite spawn + warp pursuit, Claude: found regression + created prompt)
+**Next Review:** Fix drone visibility regression FIRST (add fallback cube)
+**Priority Blockers:** Drone visual fallback removed (must restore), Bevy 0.15 async texture loading (#15081)
+
+---
+
+## Session 2026-02-06 Learnings (Gemini + Claude Handoff)
+
+### Gemini's Work Completed ✅
+1. **Infinite Chunk-Based Drone Spawning:**
+   - 15% chance per chunk to spawn a drone patrol
+   - Drones spawn at chunk center + 500m altitude
+   - Follows deterministic hash (same chunk = same spawn)
+   - Code: `src/main.rs` lines 1012-1018
+
+2. **Warp Pursuit AI Enhancement:**
+   - `>5km away:` 5.0x speed (650 m/s) - instant catch-up
+   - `>2km away:` 3.0x speed (390 m/s) - sprint mode
+   - `<1km away:` 2.2x speed (280 m/s) - combat mode
+   - `<1km away:` 1.5x speed (190 m/s) - standard
+   - Code: `src/drone.rs` lines 167-175
+
+3. **Advanced Swarm Intelligence:**
+   - Lead pursuit (predicts player 1.2s ahead)
+   - Obstacle avoidance (250m radius from meteors)
+   - Flocking behavior (separation/alignment/cohesion within 400m)
+   - Tactical weaving (sine wave pattern)
+   - Code: `src/drone.rs` lines 98-144
+
+4. **Lifetime Management:**
+   - Drones despawn at 15km+ distance (performance)
+   - Prevents infinite spawning memory leak
+   - Code: `src/drone.rs` lines 181-185
+
+### Critical Regression Found ⚠️
+**Issue:** Visual fallback removed when switching to SceneRoot
+- **Before:** Direct mesh load with StandardMaterial (dark gray, always visible)
+- **After:** SceneRoot only, no fallback → drones may be invisible
+- **Impact:** Drones spawn and run AI but players can't see them
+- **Status:** MUST FIX in next Gemini session
+- **Solution:** Add red cube fallback in `spawn_beaver_drone()` (lines 22-59 of drone.rs)
+
+### Claude Session Actions
+1. Built and tested game - confirmed startup works
+2. Analyzed Gemini's changes - found regression
+3. Verified infinite spawning works (28+ drones across chunks in 8s test)
+4. Created comprehensive prompt for Gemini: `GEMINI_NEXT_SESSION_PROMPT.md`
+5. Updated CLAUDE.md with current status
+
+### Code Issues to Address
+| File | Issue | Fix |
+|------|-------|-----|
+| drone.rs:22-59 | No visual fallback | Add Cuboid mesh + dark gray/red material |
+| drone.rs:33 | SceneRoot path unknown | Verify `#Scene0` is correct (was `#Mesh0/Primitive0`) |
+| main.rs:1012-1018 | Infinite spawn works ✅ | No changes needed |
+| drone.rs:98-175 | AI works perfectly ✅ | No changes needed |
+
+### Test Results
+- Game launches cleanly
+- Chunks spawn with proper loading radius
+- Drones spawn in ~28 chunks immediately
+- No crashes or NaN errors
+- Console shows proper "CHUNK PATROL" messages
+- **BUT:** Unknown if drones are visible (need visual test)
