@@ -3,7 +3,7 @@
 ## Project Overview
 F-16 flight simulator with infinite procedurally-generated terrain, chunk-based world loading, and arcade physics. Built with Bevy 0.15 + Avian3D physics.
 
-**Status:** Phase 2 COMPLETE + Phase 3 STARTED - Chunk-based infinite world, rocket mode, seamless sky→space, physics hardened. **Phase 3 IN PROGRESS:** Drone combat system with advanced swarm AI (lead pursuit, obstacle avoidance, flocking), missile-drone collision detection, kamikaze mechanics working. **Known issues:** Drone .glb model not rendering (using SceneRoot workaround), JPG texture async loading bug (using procedural texture workaround).
+**Status:** Phase 2 COMPLETE + Phase 3 STARTED - Chunk-based infinite world with professional asset loader, rocket mode, seamless sky→space, physics hardened. **Phase 3 IN PROGRESS:** Drone combat system with advanced swarm AI (lead pursuit, obstacle avoidance, flocking), missile-drone collision detection, kamikaze mechanics working. **Recent fixes:** Grass texture sampler configuration (fixed UV tiling artifacts), UI/Drone system scheduling (all systems properly gated by GameState). **Known issues:** Building .glb models not rendering (Bevy 0.15 SceneRoot limitation, Phase 4+).
 
 ## User Design Goals (Multi-Session Coordination)
 
@@ -14,6 +14,9 @@ F-16 flight simulator with infinite procedurally-generated terrain, chunk-based 
 - Visual style: Mix of Kenney assets (currently used for terrain)
 
 **Phase 2 Features (IMPLEMENTED):**
+- ✅ Professional asset loader: bevy_asset_loader with GameState machine (Loading → Playing)
+- ✅ Grass texture loading: PNG asset with proper UV sampler configuration (fixes tiling artifacts)
+- ✅ System scheduling: All gameplay systems gated by GameState::Playing (prevents race conditions)
 - ✅ Rocket booster mode (R key toggle): 8x thrust multiplier, reaches 25km in ~12 seconds
 - ✅ Sky→space transition: Gradual color change from blue to black (15-25km range)
 
@@ -70,10 +73,10 @@ F-16 flight simulator with infinite procedurally-generated terrain, chunk-based 
 - **Chunk coordinates:** Calculated via `ChunkCoordinate::from_world_pos(pos) = (pos.x / 1000).floor() as i32`
 
 ### Asset Loading Gotchas
-- **SceneRoot with `#Scene0` selector DOESN'T WORK** - Bevy 0.15 doesn't load scene children properly
-  - `.glb` files load but don't spawn visible children
-  - Workaround: Use `Mesh3d + MeshMaterial3d` instead (direct mesh loading)
-  - Currently spawning green test cubes (proof of concept)
+- **SceneRoot with `#Scene0` selector DOESN'T WORK** - ~~Bevy 0.15 doesn't load scene children properly~~ **[OBSOLETE - FIXED 2026-02-06]**
+  - ~~`.glb` files load but don't spawn visible children~~
+  - ✅ **RESOLVED:** Now using `Mesh3d + MeshMaterial3d` with `#Mesh0/Primitive0` selector (see line 1103)
+  - Direct mesh loading pattern working in production
 - **Assets must be in `target/release/assets/`** - game runs from executable, not source
   - Copy assets after every code change: `cp -r assets target/release/`
 - **All asset paths are case-sensitive** (even on Windows with Bevy)
@@ -82,9 +85,10 @@ F-16 flight simulator with infinite procedurally-generated terrain, chunk-based 
 - **Ambient light is ESSENTIAL** - without it, all models render pitch black
   - Added: `AmbientLight { color: WHITE, brightness: 200.0 }` in setup_scene()
   - Without this, trees were invisible despite being spawned
-- **Camera far clip plane MUST match fog distance** - prevents jagged edges at horizon
-  - Default Camera3d has far clip of 1000m, but fog ends at 10,000m
-  - **FIX:** Set `Projection::Perspective { far: 25000.0, ..default() }`
+- **Camera far clip plane MUST exceed fog distance** - prevents jagged edges at horizon
+  - Default Camera3d has far clip of 1000m (too short for large worlds)
+  - Current fog ends at 30,000m (30km)
+  - **FIX:** Set `Projection::Perspective { far: 100000.0, ..default() }` (100km)
   - Geometry was being clipped by camera before fading into fog
 - **NoFrustumCulling component** - used to prevent frustum culling issues with loaded scenes
   - Added to tree entities to guarantee visibility
@@ -125,13 +129,36 @@ F-16 flight simulator with infinite procedurally-generated terrain, chunk-based 
 
 | Error | Cause | Fix |
 |-------|-------|-----|
+| Cargo build instant (< 1s) but changes not applied | Build cache, file mtime not updated | `touch src/main.rs` then rebuild |
+| Physics feel broken, plane unstable | Performance lag from too many entities (100% village spawn) | Reduce spawn rates, check FPS in console |
 | "Path not found: assets/..." | Assets in src/assets, not target/release/assets | Copy: `cp -r assets target/release/` |
-| Jagged edges at horizon | Camera far clip (1000m) < fog distance (10km) | Set Projection::Perspective { far: 25000.0 } |
+| Jagged edges at horizon | Camera far clip (1000m) < fog distance (30km) | Set Projection::Perspective { far: 100000.0 } |
 | Trees exist but invisible | Zero ambient light | Add AmbientLight resource in setup_scene() |
 | Ground has holes/gaps | LOAD_RADIUS too small (5km) | Increase to 8km for 3km cushion |
 | Trees appearing but then disappearing | LOD system hiding them | Move LOD to PostUpdate schedule |
 | SceneRoot children not visible | Bevy 0.15 visibility bug | Use Mesh3d + MeshMaterial3d instead |
 | Player crash (NaN panic) | Invalid physics state | Add NaN check in check_ground_collision() |
+
+## Asset Library Location
+
+**External Asset Drive:** `F:\Plane_Game Assets\`
+- `kenney_fantasy-town-kit_2.0/` - Medieval buildings (currently in use)
+- `kenney_city-kit-commercial_2.1/` - Modern city buildings
+- `kenney_city-kit-suburban_20/` - Suburban houses
+- `kenney_city-kit-roads/` - Road system
+- `kenney_space-kit/` - Space assets
+- `future_fighterjet/` - Fighter jet models
+- `Grass004_1K-PNG/`, `Grass004_4K-PNG/` - High-res grass textures
+- `Resource Boy - Cloud Textures/` - Cloud atlas
+- `Sonniss.com - GDC 2019 - Game Audio Bundle/` - Professional sound effects
+- `Ultimate Stylized Nature - May 2022/` - Nature assets
+- `kenney_blocky-characters_20/` - Character models
+- `kenney_particle-pack/` - Particle effects
+- `Sci-Fi Essentials Kit[Standard]/` - Sci-fi props
+
+**Current Usage:**
+- ✅ `kenney_fantasy-town-kit_2.0/` copied to `assets/fantasy_town/`
+- ⏳ Other assets available but not yet integrated
 
 ## File Locations
 
@@ -160,19 +187,18 @@ F-16 flight simulator with infinite procedurally-generated terrain, chunk-based 
 
 ## Next Steps (Priority Order)
 
-### Priority 1: FIX ASSET LOADING (BLOCKER) ⚠️
-**Status:** Main visual blocker - trees/buildings still rendered as green cubes
-**Problem:** SceneRoot doesn't spawn visible .glb children in Bevy 0.15
-**Solution:** Replace SceneRoot with direct Mesh loading:
-1. Load glTF Mesh directly (not SceneRoot)
-2. Apply StandardMaterial manually to each mesh
-3. Spawn as Mesh3d entity instead of SceneRoot wrapper
-4. Update in: `spawn_trees_in_chunk()` function (lines 803-870)
-5. Test with: `cargo run --release` then look for actual tree models
+### Priority 1: FIX ASSET LOADING (BLOCKER) ✅ **COMPLETED 2026-02-06**
+**Status:** ~~Main visual blocker - trees/buildings still rendered as green cubes~~ **RESOLVED**
+**Problem:** ~~SceneRoot doesn't spawn visible .glb children in Bevy 0.15~~ **FIXED**
+**Solution Implemented:** Direct Mesh loading with `#Mesh0/Primitive0` selector:
+1. ✅ Load glTF Mesh directly via `Mesh3d(asset_server.load(tree_model_path))`
+2. ✅ Apply StandardMaterial manually: `MeshMaterial3d(tree_material.clone())`
+3. ✅ Spawn as Mesh3d entity (not SceneRoot wrapper)
+4. ✅ Updated in: `spawn_trees_in_chunk()` function (lines 1103-1104)
+5. ✅ Trees now render with proper mesh loading
 
-**Why this matters:** All other systems work (chunks, physics, rendering pipeline). Just need to swap placeholder Cuboid for real Mesh loading.
-**Estimated time:** 1-2 hours
-**Unblocks:** Actual tree/building visibility, completion of Phase 1 visual representation
+**Result:** Asset loading pipeline working. Trees load as direct meshes with materials applied.
+**Completed:** 2026-02-06
 
 ### Priority 2: Verify Phase 1 & 2 Complete
 - Run game and check:
@@ -203,6 +229,12 @@ cp -r /c/Users/Box/plane_game/assets /c/Users/Box/plane_game/target/release/
 # Build and run (release mode)
 cd /c/Users/Box/plane_game && cargo build --release && target/release/plane_game.exe
 
+# Force rebuild when cargo caches changes (verify with compile time >1m)
+touch src/main.rs && cargo build --release
+
+# Test console output for specific features (villages, roofs, drones)
+timeout 10 target/release/plane_game.exe 2>&1 | grep -E "(🏘️|🏠|CHUNK PATROL)"
+
 # Quick test (8 second timeout)
 cd /c/Users/Box/plane_game && timeout 8 target/release/plane_game.exe 2>&1 | grep -E "(LOD|CHUNK|SPAWN|children)"
 
@@ -221,8 +253,16 @@ ffmpeg -i input.ogg -vn -c:a copy output.ogg
 
 ## Known Limitations
 
-- **SceneRoot broken in Bevy 0.15** for simple .glb files (no scene hierarchy)
-  - Workaround: Load Mesh directly from glTF instead
+- **SceneRoot broken in Bevy 0.15** for simple .glb files (no scene hierarchy) **[PARTIALLY RESOLVED]**
+  - ✅ **Trees FIXED:** Now using direct Mesh3d loading with `#Mesh0/Primitive0` selector (line 1103)
+  - ⚠️ **Buildings PARTIALLY WORKING (2026-02-15):**
+    - ✅ Walls rendering successfully with Mesh3d + MeshMaterial3d
+    - ❌ Roofs NOT visible (roof-gable.glb asset loading issue)
+    - **Current fix:** Using SceneRoot + fallback red cube for roof visibility
+    - **Material fix:** Separated wall_material (brown) from roof_material (red-brown tint)
+    - **Issue:** Direct Mesh3d loading may not work for complex roof geometry
+    - **Affected code:** main.rs lines 1340-1410 (spawn_village_in_chunk)
+    - **Testing needed:** Verify fallback cubes appear, then debug GLB scene path
 - **No multi-GPU support** - single-threaded asset loading can stall frames
 - **Collision system** - only checks Y position, not actual AABB collision
 - **No night mode** - AmbientLight always on, no day/night cycle
@@ -237,6 +277,8 @@ ffmpeg -i input.ogg -vn -c:a copy output.ogg
 - **Transform hierarchy:** Child entities use LOCAL coordinates; chunk parent handles world positioning
 - **Component naming:** Use clear prefixes (Tree, VillageBuilding, ChunkEntity) for system queries
 - **Debug logging:** Use eprintln!() for console output (survives release builds)
+- **Fallback visual debug:** For asset loading issues, use `.with_children(|parent| { parent.spawn(Mesh3d(Cuboid)) })` with bright contrasting color
+- **Spawn rate tuning:** Probabilistic spawns (villages, drones) - start at 15% for testing visibility, reduce to 5% for production performance
 
 ## Testing Checklist
 
@@ -246,6 +288,9 @@ ffmpeg -i input.ogg -vn -c:a copy output.ogg
 - [ ] Assets load from target/release/assets/ correctly
 - [ ] Frame rate stable at 60+ FPS when flying
 - [ ] Chunk loading/unloading smooth (no sudden pops)
+- [ ] Code changes compiled (verify build time >1m, not cached <1s)
+- [ ] Probabilistic spawns working (check console for 🏘️ village, 🛸 drone messages)
+- [ ] Performance acceptable (villages at 15% spawn = <10% FPS impact)
 
 ## Multi-Chat Coordination
 
@@ -304,6 +349,7 @@ ffmpeg -i input.ogg -vn -c:a copy output.ogg
    - Root cause: Bevy 0.15 SceneRoot mesh loading complexity (known limitation)
    - Fix attempted: Direct mesh loading with `#Mesh0/Primitive0` selector - didn't work
    - Better approach: Confirm correct scene path with `#Scene0` or use different asset format
+   - **Note:** Tree loading now works with Mesh3d pattern (see line 1103) - same approach could work for drones
 
 ### Code Patterns That Worked Well
 1. **NaN Detection Pattern:**
@@ -353,16 +399,18 @@ ffmpeg -i input.ogg -vn -c:a copy output.ogg
 ## AI Workflow & Maintenance
 
 **Memory File Status:** CLAUDE.md is the Source of Truth
-- Updated whenever major features complete or blockers identified
-- Consolidates knowledge from multi-chat sessions (Gemini, Claude, Copilot)
-- New sessions: Start by reading main.rs + CLAUDE.md only
+- Updated whenever major features complete or blockers identified.
+- **Documentation Hub:** Located in the `docs/` folder.
+  - `docs/TECHNICAL_KNOWLEDGE.md`: Consolidates physics safety, asset workarounds, and Bevy 0.15 specifics.
+  - `docs/FEATURE_PLANS.md`: Active plans for Phase 3 combat and future UI/Environment polish.
+- **Archive:** Outdated session logs and prompts are moved to `docs/archive/`.
 
-**Project Files:** Recently cleaned (27 outdated .md files removed on 2026-02-05)
-- **KEEP:** README.md, CLAUDE.md, GAME_DESIGN.md, FIXES_APPLIED.md, PHASE3_IMPLEMENTATION_PROMPTS.md
-- **Git Strategy:** Run `git commit` before major refactors as safety checkpoint
-- **Code Management:** Keep main.rs under 1500-2000 lines before splitting
+**Project Files:** Cleaned and consolidated (2026-02-15)
+- **KEEP:** README.md, CLAUDE.md, GAME_DESIGN.md.
+- **Git Strategy:** Run `git commit` before major refactors as safety checkpoint.
+- **Code Management:** Keep main.rs under 1500-2000 lines before splitting.
 
-**Last Updated:** 2026-02-06 12:15 (Gemini: infinite spawn + warp pursuit, Claude: found regression + created prompt)
+**Last Updated:** 2026-02-15 (Documentation consolidated into /docs)
 **Next Review:** Fix drone visibility regression FIRST (add fallback cube)
 **Priority Blockers:** Drone visual fallback removed (must restore), Bevy 0.15 async texture loading (#15081)
 
@@ -426,3 +474,56 @@ ffmpeg -i input.ogg -vn -c:a copy output.ogg
 - No crashes or NaN errors
 - Console shows proper "CHUNK PATROL" messages
 - **BUT:** Unknown if drones are visible (need visual test)
+
+---
+
+## Session 2026-02-15 Learnings (Claude Session)
+
+### Issue Identified: Village Roofs Not Rendering
+**User reported via screenshot:**
+- ✅ Building walls rendering (brown boxes)
+- ❌ Roofs completely missing (should have gabled red/brown roofs)
+- ❌ Distant buildings showing yellow/white color (wrong material)
+
+### Root Causes Found
+1. **Material blending** - Single brown material used for both walls AND roofs made roofs invisible
+2. **Mesh loading method** - Direct `Mesh3d` with `#Mesh0/Primitive0` may not work for complex roof geometry
+3. **No visual fallback** - If GLB fails to load, nothing renders
+
+### Fix Applied (main.rs:1340-1410)
+1. **Separated materials:**
+   - `wall_material` - Darker brown for building bases
+   - `roof_material` - Bright red-brown tint (0.8, 0.3, 0.2) for visibility
+   - Both use `colormap.png` texture but roof has color tint overlay
+
+2. **Changed roof loading method:**
+   - **Before:** `Mesh3d(asset_server.load("roof-gable.glb#Mesh0/Primitive0"))`
+   - **After:** `SceneRoot(asset_server.load("roof-gable.glb#Scene0"))`
+   - Reasoning: SceneRoot may handle complex geometry better (works for meteors/turrets)
+
+3. **Added fallback visual:**
+   - Red `Cuboid(2.0, 1.0, 2.0)` spawned as child of roof entity
+   - Guarantees roofs visible even if GLB fails
+   - Can be removed once GLB loading confirmed working
+
+4. **Debug logging:**
+   - Added `println!("🏠 Spawning roof at ...")` to track roof entity creation
+
+### Testing Status
+- ✅ Build successful (1m 42s compile time)
+- ⚠️ Runtime testing needed to verify:
+  - [ ] Red fallback cubes visible on buildings
+  - [ ] Walls remain brown (not yellow/white)
+  - [ ] Console shows roof spawn messages
+  - [ ] FPS stable with new rendering approach
+
+### Next Steps
+1. **Run game and verify fallback cubes visible**
+2. **If cubes visible:** GLB loading confirmed broken, try alternative roof assets
+3. **If cubes NOT visible:** Position/scale issue, need to adjust Transform values
+4. **Once working:** Remove fallback cubes, tune roof material color
+
+### Files Modified
+- `src/main.rs:1340-1410` - spawn_village_in_chunk() material separation + roof fallback
+- `CLAUDE.md` - Updated Known Limitations section
+- Created `/c/Users/Box/VILLAGE_ROOF_FIX.md` - Detailed fix documentation

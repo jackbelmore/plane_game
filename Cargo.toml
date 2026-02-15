@@ -8,6 +8,9 @@ edition = "2021"
 bevy = { version = "0.15" }
 avian3d = { version = "0.2", features = ["f32"] }
 rand = "0.8"
+bevy_asset_loader = "0.22"
+winit = "0.30"
+image = "0.25"
 
 # Development Profile (cargo run)
 [profile.dev]
