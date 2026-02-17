@@ -5,11 +5,13 @@ use bevy::{
     image::{ImageSampler, ImageAddressMode, ImageSamplerDescriptor},
     window::PrimaryWindow,
     winit::WinitWindows,
+    core_pipeline::bloom::{Bloom, BloomCompositeMode},
 };
 use winit::window::Icon;
 use avian3d::prelude::*;
 use rand::prelude::*;
 use std::io::Write;
+use noise::{NoiseFn, Perlin}; // Added for terrain generation
 
 mod drone;
 mod ui; // NEW: HUD System
@@ -23,9 +25,33 @@ use drone::{Drone, DronePlugin};
 pub enum GameState {
     #[default]
     Loading,
+    Spawning, // One-time setup state
     Playing,
+    Paused,
 }
 
+/// Generate terrain height using Perlin noise
+fn get_terrain_height(world_x: f32, world_z: f32) -> f32 {
+    let perlin = Perlin::new(42); // Fixed seed for deterministic terrain
+
+    // Layer 1: Large rolling hills (500m wavelength, 100m amplitude - doubled for visibility)
+    let scale_large = 0.002; // 1/500
+    let height_large = perlin.get([world_x as f64 * scale_large, world_z as f64 * scale_large]) as f32 * 100.0;
+
+    // Layer 2: Medium features (100m wavelength, 15m amplitude)
+    let scale_medium = 0.01; // 1/100
+    let height_medium = perlin.get([world_x as f64 * scale_medium + 100.0, world_z as f64 * scale_medium + 100.0]) as f32 * 15.0;
+
+    // Layer 3: Small details (20m wavelength, 3m amplitude)
+    let scale_small = 0.05; // 1/20
+    let height_small = perlin.get([world_x as f64 * scale_small + 200.0, world_z as f64 * scale_small + 200.0]) as f32 * 3.0;
+
+    // Combine layers (additive for natural-looking terrain)
+    let total_height = height_large + height_medium + height_small;
+
+    // Clamp to reasonable range (prevent crazy mountains)
+    total_height.clamp(-50.0, 150.0) // Increased range for more dramatic terrain
+}
 
 // #region agent log
 fn debug_log(location: &str, message: &str, data: &str, hypothesis_id: &str) {
@@ -175,9 +201,140 @@ struct EngineSound;
 #[derive(Component)]
 struct WindSound;
 
+/// Marker for the air rip / wing stress sound
+#[derive(Component)]
+struct WindStressSound;
+
 /// Marker for the warning sound entity
 #[derive(Component)]
 struct WarningSound;
+
+/// Component for manual audio attenuation (fading volume with distance)
+/// Used to bypass Bevy's spatial audio limitations with stereo files
+#[derive(Component)]
+struct ManualAttenuation {
+    max_distance: f32, // Not used for inverse square, but good for culling
+    reference_distance: f32, // Distance where volume is 50%
+    base_volume: f32,
+    age: f32,
+    doppler_ramp_time: f32, // Seconds to transition to full Doppler (preserves initial punch)
+}
+
+/// System to manually update volume based on distance to player
+/// Solves "silent spatial audio" issues
+fn update_manual_audio_attenuation(
+    time: Res<Time>,
+    player_query: Query<(&GlobalTransform, &LinearVelocity), With<PlayerPlane>>,
+    mut audio_query: Query<(&GlobalTransform, &AudioSink, &mut ManualAttenuation, Option<&Parent>)>,
+    velocity_query: Query<&LinearVelocity>,
+) {
+    let Ok((player_transform, player_velocity)) = player_query.get_single() else { return };
+    let player_pos = player_transform.translation();
+
+    let mut count = 0;
+    for (transform, sink, mut settings, parent) in &mut audio_query {
+        count += 1;
+        settings.age += time.delta_secs();
+
+        let sound_pos = transform.translation();
+        let distance = player_pos.distance(sound_pos);
+        
+        // Skip processing if too far to save performance
+        if distance > settings.max_distance {
+            sink.set_volume(0.0);
+            continue;
+        }
+
+        // 1. INVERSE SQUARE LAW (Realistic attenuation)
+        // volume = ref / (ref + dist)
+        // This ensures it never cuts off, but fades naturally forever
+        let volume_fraction = settings.reference_distance / (settings.reference_distance + distance);
+        sink.set_volume(settings.base_volume * volume_fraction);
+
+        // 2. DOPPLER SHIFT
+        // Need relative velocity along the line of sight
+        let mut source_velocity = Vec3::ZERO;
+        
+        // Try to get velocity from parent (e.g. Missile)
+        if let Some(parent_entity) = parent {
+            if let Ok(vel) = velocity_query.get(parent_entity.get()) {
+                source_velocity = vel.0;
+            }
+        }
+
+        let direction_to_player = (player_pos - sound_pos).normalize_or_zero();
+        let relative_velocity = source_velocity - player_velocity.0;
+        let speed_towards_player = relative_velocity.dot(direction_to_player);
+
+        // Speed of sound ~343 m/s
+        // Pitch = 1.0 + (v / c)
+        // Tune Doppler effect with a scaling factor (0.5 is standard "cinematic" value)
+        const DOPPLER_SCALE: f32 = 0.5;
+        let doppler_factor = (speed_towards_player / 343.0) * DOPPLER_SCALE;
+        
+        // Limit pitch shift to avoid craziness (0.5x to 2.0x) - Standard range
+        // This prevents the sound from disappearing into sub-bass rumble
+        let target_pitch = (1.0 + doppler_factor).clamp(0.5, 2.0);
+        
+        // Doppler Ramp: Blend from 1.0 (Normal) to Target (Doppler) based on age
+        // This preserves the initial "Punch" of the sound before physics takes over
+        let ramp_factor = (settings.age / settings.doppler_ramp_time).clamp(0.0, 1.0);
+        
+        // LERP: Start at 1.0, fade to target_pitch
+        let current_pitch = 1.0 + (target_pitch - 1.0) * ramp_factor;
+        
+        sink.set_speed(current_pitch);
+
+        // DEBUG: Print info for the first active sound only
+        if count == 1 {
+            println!("[AUDIO] Active: {} | Age: {:.2}s | Dist: {:.1}m | Pitch: {:.2}x (Tgt: {:.2}x)", 
+                count, settings.age, distance, current_pitch, target_pitch);
+        }
+    }
+}
+
+/// System to handle high-G "Air Rip" sound during turns
+fn update_maneuver_audio(
+    player_query: Query<&AngularVelocity, With<PlayerPlane>>,
+    mut audio_query: Query<&AudioSink, With<WindStressSound>>,
+) {
+    if let Ok(ang_vel) = player_query.get_single() {
+        // High-G turn detection (rotation speed)
+        let rotation_intensity = ang_vel.0.length();
+        
+        // Threshold: Starts becoming audible at 1.5 rad/s
+        let target_volume = ((rotation_intensity - 1.5) * 0.6).clamp(0.0, 1.0);
+        
+        for sink in &mut audio_query {
+            sink.set_volume(target_volume);
+            // Increase pitch slightly as G-force increases
+            sink.set_speed(0.8 + target_volume * 0.4);
+        }
+    }
+}
+
+/// Trigger cinematic "Boom" when afterburner kicks in
+fn update_afterburner_audio(
+    player_query: Query<&PlayerInput, With<PlayerPlane>>,
+    mut commands: Commands,
+    assets: Res<GameAssets>,
+    mut prev_throttle: Local<f32>,
+) {
+    if let Ok(input) = player_query.get_single() {
+        // If throttle just jumped into the "boost" zone (0.9+)
+        if input.throttle > 0.9 && *prev_throttle <= 0.9 {
+            commands.spawn((
+                AudioPlayer(assets.afterburner_thump.clone()),
+                PlaybackSettings {
+                    mode: bevy::audio::PlaybackMode::Despawn,
+                    volume: bevy::audio::Volume::new(1.5), // Loud thump
+                    ..default()
+                },
+            ));
+        }
+        *prev_throttle = input.throttle;
+    }
+}
 
 /// Marker for the container that holds the visual model
 /// Allowing us to rotate the model (e.g. for banking) without affecting physics
@@ -481,7 +638,7 @@ const MASS_KG: f32 = 9000.0; // Approx loaded weight
 
 const BULLET_SPEED: f32 = 600.0; // Faster bullets for scale
 const BULLET_LIFETIME: f32 = 3.0;
-const FIRE_RATE: f32 = 13.5; // Reduced by 10% (was 15.0)
+const FIRE_RATE: f32 = 10.125; // Reduced by 25% (was 13.5)
 const FIRE_COOLDOWN: f32 = 1.0 / FIRE_RATE;
 
 // Machine Gun Constants
@@ -503,6 +660,10 @@ const MISSILE_LENGTH: f32 = 2.0;
 const MISSILE_BODY_RADIUS: f32 = 0.15;
 const MISSILE_FIN_SIZE: f32 = 0.3;
 
+fn finish_spawning(mut next_state: ResMut<NextState<GameState>>) {
+    next_state.set(GameState::Playing);
+}
+
 // ============================================================================
 // MAIN FUNCTION
 // ============================================================================
@@ -520,7 +681,7 @@ fn main() {
         .init_state::<GameState>()
         .add_loading_state(
             LoadingState::new(GameState::Loading)
-                .continue_to_state(GameState::Playing)
+                .continue_to_state(GameState::Spawning)
                 .load_collection::<GameAssets>()
         )
         .insert_resource(ClearColor(Color::srgb(0.5, 0.6, 0.8))) // Skybox match
@@ -530,7 +691,7 @@ fn main() {
         .init_resource::<ChunkManager>() // NEW: Chunk Manager
         .add_plugins(DronePlugin)
         .add_plugins(ui::UiPlugin) // NEW: HUD
-        .add_systems(OnEnter(GameState::Playing), (
+        .add_systems(OnEnter(GameState::Spawning), (
             set_window_icon,
             configure_grass_texture_sampler,
             setup_scene,
@@ -538,10 +699,15 @@ fn main() {
             spawn_objectives,
             spawn_turrets,
             spawn_player,
+            finish_spawning, // Transition to Playing immediately
         ).chain())
         .add_systems(PreUpdate, (
             safety_check_nan, // NEW: Global NaN protection
             check_ground_collision.run_if(in_state(GameState::Playing)), // Before physics so AABB never sees invalid state
+        ))
+        .add_systems(Update, (
+            handle_pause_input, // NEW: Pause input runs always
+            update_manual_audio_attenuation, // NEW: Manual audio attenuation runs always
         ))
         // Bevy has a 20-system tuple limit per add_systems; split to avoid overflow when adding more
         .add_systems(Update, (
@@ -560,6 +726,8 @@ fn main() {
             update_horizon_disk, // NEW: Keep horizon disk centered on camera (XZ)
             update_flight_camera,
             debug_flight_data,
+            update_maneuver_audio,   // NEW: Wind rip sound
+            update_afterburner_audio, // NEW: Afterburner thump
             // debug_flight_dynamics, // REMOVED: Too noisy
         ).run_if(in_state(GameState::Playing)))
         .add_systems(PostUpdate, update_lod_levels.run_if(in_state(GameState::Playing))) // MOVED to PostUpdate so trees are spawned before LOD processes them
@@ -655,7 +823,7 @@ fn setup_scene(
     // Restore AmbientLight (so scene isn't black)
     commands.insert_resource(AmbientLight {
         color: Color::WHITE,
-        brightness: 200.0,
+        brightness: 80.0, // HDR-safe: 200.0 caused black screen with bloom (over-exposure)
     });
 
     // === CREATE SHARED GROUND MATERIAL WITH ASSET LOADER TEXTURE ===
@@ -748,8 +916,13 @@ fn setup_scene(
     // FIX: Linear fog keeps ground crisp for 10km, gentle fade to 30km (flight sim standard)
     commands.spawn((
         Camera3d::default(),
-        bevy::core_pipeline::tonemapping::Tonemapping::TonyMcMapface,
-        bevy::core_pipeline::bloom::Bloom::NATURAL, // FIX: Use NATURAL preset for proper bloom
+        Camera { hdr: true, ..default() }, // REQUIRED: Bloom needs HDR or all values are clamped to 1.0
+        Msaa::Off, // HDR + MSAA causes black screen/artifacts in Bevy 0.15 - must disable
+        // ReinhardLuminance does NOT require tonemapping_luts feature (safe fallback)
+        // TonyMcMapface requires tonemapping_luts cargo feature - using Reinhard to isolate black screen
+        bevy::core_pipeline::tonemapping::Tonemapping::ReinhardLuminance,
+        // Bloom::NATURAL preset - proven working in official Bevy 0.15 bloom_3d example
+        bevy::core_pipeline::bloom::Bloom::NATURAL,
         SpatialListener::default(), // FIXED: Enable spatial audio by attaching listener to camera
         Projection::Perspective(PerspectiveProjection {
             far: 100000.0,  // Increased further to cover massive distances
@@ -765,6 +938,19 @@ fn setup_scene(
         },
         Transform::from_xyz(0.0, 50.0, 15.0).looking_at(Vec3::ZERO, Vec3::Y),
         GlobalTransform::default(),
+    ));
+
+    // FIX G: TEMPORARY - Bloom test sphere to verify bloom is working
+    // TODO: DELETE after verifying bloom works (should see bright green glow halo)
+    commands.spawn((
+        Mesh3d(meshes.add(Sphere::new(5.0))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.0, 1.0, 0.0),
+            emissive: LinearRgba::rgb(20.0, 50.0, 20.0),
+            unlit: true,
+            ..default()
+        })),
+        Transform::from_translation(Vec3::new(0.0, 510.0, -50.0)), // Near player spawn
     ));
 
     // Drones now spawn via the chunk system (infinite patrols)
@@ -944,6 +1130,73 @@ fn update_lod_levels(
     }
 }
 
+/// Create terrain mesh with heightmap applied
+fn create_terrain_mesh(
+    chunk_coord: ChunkCoordinate,
+    meshes: &mut Assets<Mesh>,
+) -> Handle<Mesh> {
+    const SUBDIVISIONS: usize = 20; // 20x20 grid = 400 triangles per chunk
+    // CHUNK_SIZE is already defined globally
+
+    let chunk_world_x = chunk_coord.x as f32 * CHUNK_SIZE;
+    let chunk_world_z = chunk_coord.z as f32 * CHUNK_SIZE;
+
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    let mut indices = Vec::new();
+
+    // Generate vertices with heightmap
+    for z in 0..=SUBDIVISIONS {
+        for x in 0..=SUBDIVISIONS {
+            let local_x = (x as f32 / SUBDIVISIONS as f32) * CHUNK_SIZE - CHUNK_SIZE / 2.0;
+            let local_z = (z as f32 / SUBDIVISIONS as f32) * CHUNK_SIZE - CHUNK_SIZE / 2.0;
+
+            let world_x = chunk_world_x + local_x;
+            let world_z = chunk_world_z + local_z;
+
+            let height = get_terrain_height(world_x, world_z);
+
+            positions.push([local_x, height, local_z]);
+            normals.push([0.0, 1.0, 0.0]); // Simple normal (could calculate from neighbors for lighting)
+            
+            // UV tiling: Multiply by 10.0 to match the previous Plane3d tiling
+            let u = (x as f32 / SUBDIVISIONS as f32) * 10.0;
+            let v = (z as f32 / SUBDIVISIONS as f32) * 10.0;
+            uvs.push([u, v]);
+        }
+    }
+
+    // Generate indices (two triangles per quad)
+    for z in 0..SUBDIVISIONS {
+        for x in 0..SUBDIVISIONS {
+            let i0 = (z * (SUBDIVISIONS + 1) + x) as u32;
+            let i1 = i0 + 1;
+            let i2 = i0 + (SUBDIVISIONS + 1) as u32;
+            let i3 = i2 + 1;
+
+            indices.push(i0);
+            indices.push(i2);
+            indices.push(i1);
+
+            indices.push(i1);
+            indices.push(i2);
+            indices.push(i3);
+        }
+    }
+
+    let mut mesh = Mesh::new(
+        bevy::render::mesh::PrimitiveTopology::TriangleList,
+        bevy::render::render_asset::RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(bevy::render::mesh::Indices::U32(indices));
+
+    meshes.add(mesh)
+}
+
 fn spawn_chunk(
     commands: &mut Commands,
     asset_server: &AssetServer,
@@ -982,21 +1235,15 @@ fn spawn_chunk(
         // Final sanity check for collider dimensions
         if half_size > 0.0 && half_size.is_finite() && thickness > 0.0 {
             // Create ground mesh with UV tiling for texture detail
-            let mut mesh = Mesh::from(Plane3d::new(Vec3::Y, Vec2::splat(CHUNK_SIZE)));
-            // Add UV tiling - 10x repeat across the chunk
-            if let Some(VertexAttributeValues::Float32x2(uvs)) = mesh.attribute_mut(Mesh::ATTRIBUTE_UV_0) {
-                for uv in uvs {
-                    uv[0] *= 10.0;
-                    uv[1] *= 10.0;
-                }
-            }
+            // REPLACED: Use heightmap mesh instead of flat plane
+            let mesh_handle = create_terrain_mesh(chunk_coord, meshes);
 
             parent.spawn((
                 ChunkEntity,
                 chunk_coord,
-                Mesh3d(meshes.add(mesh)),
+                Mesh3d(mesh_handle),
                 MeshMaterial3d(ground_material),
-                Transform::from_xyz(0.0, -5.0, 0.0),
+                Transform::from_xyz(0.0, 0.0, 0.0), // No Y offset - terrain heights are baked into vertices
                 GlobalTransform::default(),
                 Visibility::default(),
                 InheritedVisibility::default(),
@@ -1092,7 +1339,13 @@ fn spawn_trees_in_chunk(
             let scale = chunk_rng.gen_range(3.0..6.0);
 
             // Use LOCAL coordinates because trees are now children of the chunk
-            let tree_local_pos = Vec3::new(x, 0.0, z); // FIX: Place at ground level (Y=0)
+            // Get terrain height for Y position
+            let world_x = chunk_coord.x as f32 * CHUNK_SIZE + x;
+            let world_z = chunk_coord.z as f32 * CHUNK_SIZE + z;
+            let terrain_height = get_terrain_height(world_x, world_z);
+            
+            // Offset by +5.0 because chunk parent is at Y=-5.0
+            let tree_local_pos = Vec3::new(x, terrain_height + 5.0, z);
 
             parent.spawn((
                 Tree,
@@ -1150,13 +1403,18 @@ fn spawn_rocks_in_chunk(
             let scale = chunk_rng.gen_range(0.8..1.5);
             let rotation = Quat::from_rotation_y(chunk_rng.gen_range(0.0..std::f32::consts::TAU));
 
+            // Get terrain height
+            let world_x = chunk_coord.x as f32 * CHUNK_SIZE + x;
+            let world_z = chunk_coord.z as f32 * CHUNK_SIZE + z;
+            let terrain_height = get_terrain_height(world_x, world_z);
+
             parent.spawn((
                 ChunkEntity,
                 chunk_coord,
                 Mesh3d(rock_mesh.clone()),
                 MeshMaterial3d(rock_material.clone()),
                 Transform {
-                    translation: Vec3::new(x, 7.5 * scale, z), // Half height so it sits on ground
+                    translation: Vec3::new(x, terrain_height + 5.0 + (7.5 * scale), z), // +5 for chunk offset, +half_height for pivot
                     rotation,
                     scale: Vec3::splat(scale),
                 },
@@ -1365,6 +1623,8 @@ fn spawn_village_in_chunk(
         let building_z = village_center.z + angle.sin() * BUILDING_DISTANCE;
         let rotation = Quat::from_rotation_y(angle + std::f32::consts::PI);
 
+        let terrain_height = get_terrain_height(building_x, building_z);
+
         // Building Base (Wall)
         commands.spawn((
             VillageBuilding,
@@ -1373,7 +1633,7 @@ fn spawn_village_in_chunk(
             Mesh3d(asset_server.load("fantasy_town/wall.glb#Mesh0/Primitive0")),
             MeshMaterial3d(wall_material.clone()),
             Transform {
-                translation: Vec3::new(building_x, -0.5, building_z),
+                translation: Vec3::new(building_x, terrain_height - 0.5, building_z),
                 rotation,
                 scale: Vec3::splat(6.0),
             },
@@ -1385,14 +1645,14 @@ fn spawn_village_in_chunk(
         ));
 
         // Building Roof (with fallback cube for visibility)
-        println!("  🏠 Spawning roof at ({}, 32.0, {})", building_x, building_z);
+        println!("  🏠 Spawning roof at ({}, {}, {})", building_x, terrain_height + 32.0, building_z);
         commands.spawn((
             VillageBuilding,
             ChunkEntity,
             chunk_coord,
             SceneRoot(asset_server.load("fantasy_town/roof-gable.glb#Scene0")),
             Transform {
-                translation: Vec3::new(building_x, 32.0, building_z),
+                translation: Vec3::new(building_x, terrain_height + 32.0, building_z),
                 rotation,
                 scale: Vec3::splat(6.0),
             },
@@ -1411,6 +1671,7 @@ fn spawn_village_in_chunk(
     }
 
     // Central Tower
+    let tower_height = get_terrain_height(village_center.x, village_center.z);
     commands.spawn((
         VillageBuilding,
         ChunkEntity,
@@ -1418,7 +1679,7 @@ fn spawn_village_in_chunk(
         Mesh3d(asset_server.load("fantasy_town/wall.glb#Mesh0/Primitive0")),
         MeshMaterial3d(wall_material.clone()),
         Transform {
-            translation: village_center,
+            translation: Vec3::new(village_center.x, tower_height - 0.5, village_center.z),
             rotation: Quat::IDENTITY,
             scale: Vec3::splat(20.0),
         },
@@ -1706,11 +1967,23 @@ fn update_turrets(
 
 /// Dynamic engine and environmental audio system
 fn update_engine_audio(
+    game_state: Res<State<GameState>>,
     player_query: Query<(&PlayerInput, &LinearVelocity, &Transform), With<PlayerPlane>>,
     mut engine_audio_query: Query<&AudioSink, (With<EngineSound>, Without<WindSound>, Without<WarningSound>)>,
     mut wind_audio_query: Query<&AudioSink, (With<WindSound>, Without<EngineSound>, Without<WarningSound>)>,
     mut warning_audio_query: Query<&AudioSink, (With<WarningSound>, Without<EngineSound>, Without<WindSound>)>,
 ) {
+    // Pause all audio when game is paused
+    if game_state.get() == &GameState::Paused {
+        for sink in &mut engine_audio_query {
+            sink.pause();
+        }
+        for sink in &mut wind_audio_query {
+            sink.pause();
+        }
+        return;
+    }
+
     if let Ok((input, velocity, transform)) = player_query.get_single() {
         let speed = velocity.0.length();
         
@@ -1725,18 +1998,6 @@ fn update_engine_audio(
         for sink in &mut wind_audio_query {
             sink.set_volume(wind_volume);
             sink.set_speed(0.9 + (speed / 500.0) * 0.3);
-        }
-
-        // Warning Alarm: Trigger if altitude is low and speed is high (Danger zone)
-        let altitude = transform.translation.y;
-        let danger = altitude < 100.0 && speed > 200.0;
-        for sink in &mut warning_audio_query {
-            if danger {
-                sink.play();
-                sink.set_volume(0.4);
-            } else {
-                sink.pause();
-            }
         }
     }
 }
@@ -1833,6 +2094,17 @@ fn spawn_player(
                 mode: bevy::audio::PlaybackMode::Loop,
                 volume: bevy::audio::Volume::new(0.0), // Starts silent
                 paused: true, // Only plays in danger
+                ..default()
+            },
+        ));
+
+        // Air Rip / Wing Stress loop (Cinematic)
+        parent.spawn((
+            WindStressSound,
+            AudioPlayer(sounds.air_rip.clone()),
+            PlaybackSettings {
+                mode: bevy::audio::PlaybackMode::Loop,
+                volume: bevy::audio::Volume::new(0.0), // Silent until high-G turn
                 ..default()
             },
         ));
@@ -2495,6 +2767,31 @@ fn debug_flight_data(
     }
 }
 
+/// Handle global pause toggle (P key)
+/// Runs in all states to allow unpausing
+fn handle_pause_input(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    state: Res<State<GameState>>,
+    mut next_state: ResMut<NextState<GameState>>,
+    mut physics_time: ResMut<Time<Physics>>,
+) {
+    if keyboard_input.just_pressed(KeyCode::KeyP) {
+        match state.get() {
+            GameState::Playing => {
+                next_state.set(GameState::Paused);
+                physics_time.pause();
+                println!("⏸️  PAUSED - Physics Frozen");
+            }
+            GameState::Paused => {
+                next_state.set(GameState::Playing);
+                physics_time.unpause();
+                println!("▶️  RESUMED - Physics Active");
+            }
+            _ => {}
+        }
+    }
+}
+
 fn handle_quit(
     keyboard_input: Res<ButtonInput<KeyCode>>,
     mut exit: EventWriter<AppExit>,
@@ -2519,12 +2816,13 @@ fn handle_restart(
     >,
     mut commands: Commands,
     drone_query: Query<Entity, With<Drone>>,
+    projectile_query: Query<Entity, With<Projectile>>, // Added Projectile query
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // ESC or F5 to respawn
-    if keyboard_input.just_pressed(KeyCode::Escape) || keyboard_input.just_pressed(KeyCode::F5) {
+    // F5 to respawn (ESC removed to avoid accidental restarts)
+    if keyboard_input.just_pressed(KeyCode::F5) {
         if let Ok((mut transform, mut lin_vel, mut ang_vel, mut input, mut fbw)) =
             player_query.get_single_mut()
         {
@@ -2535,7 +2833,12 @@ fn handle_restart(
                 commands.entity(drone_entity).despawn_recursive();
             }
 
-            // 2. Reset position to spawn point
+            // 2. Clear existing projectiles (and their attached sounds)
+            for proj_entity in &projectile_query {
+                commands.entity(proj_entity).despawn_recursive();
+            }
+
+            // 3. Reset position to spawn point
             transform.translation = Vec3::new(0.0, 500.0, 0.0);
             transform.rotation = Quat::IDENTITY;
 
@@ -2576,6 +2879,7 @@ fn debug_asset_loading(
 
 fn handle_shooting_input(
     keyboard: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>, // Added mouse input
     time: Res<Time>,
     mut player_query: Query<(Entity, &Transform, &LinearVelocity, &mut LastShotTime), With<PlayerPlane>>,
     mut commands: Commands,
@@ -2585,7 +2889,7 @@ fn handle_shooting_input(
 ) {
     if let Ok((player_entity, player_transform, player_velocity, mut last_shot)) = player_query.get_single_mut() {
         let current_time = time.elapsed_secs();
-        let can_shoot = keyboard.pressed(KeyCode::Space)
+        let can_shoot = (keyboard.pressed(KeyCode::Space) || mouse.pressed(MouseButton::Right))
             && (current_time - last_shot.time >= FIRE_COOLDOWN);
 
         if can_shoot {
@@ -2597,35 +2901,45 @@ fn handle_shooting_input(
             let bullet_velocity = player_velocity.0 + (forward * BULLET_SPEED);
 
             // Spawn missile with proper orientation and visuals
-            spawn_missile(&mut commands, &mut meshes, &mut materials, gun_position_world, player_transform.rotation, bullet_velocity);
+            let missile_entity = spawn_missile(&mut commands, &mut meshes, &mut materials, gun_position_world, player_transform.rotation, bullet_velocity);
             
             // Pass local GUN_OFFSET and parent to plane
             spawn_muzzle_flash(&mut commands, &mut meshes, &mut materials, GUN_OFFSET, Some(player_entity));
 
             // Play missile launch sound
-            // Logic: Play heavy "Hero" sound rarely (1 in 15), otherwise play light sound
+            // Logic: Play heavy "Hero" sound MORE often (1 in 5)
             let mut rng = rand::thread_rng();
-            let (sound, volume) = if rng.gen_bool(1.0 / 15.0) {
-                (sounds.missile_hero.clone(), 1.0) // Hero: Maximum volume for impact
+            let (sound, volume) = if rng.gen_bool(1.0 / 5.0) { 
+                (sounds.missile_hero.clone(), 1.5) // 1.5x (Balanced loudness)
             } else {
-                (sounds.missile_light.clone(), 0.6) // Light: Boosted for audibility over engine
+                (sounds.missile_light.clone(), 1.0) // 1.0x (Standard loudness)
             };
 
             // Add slight pitch variation to everything
             let pitch_speed = rng.gen_range(0.9..1.1);
 
-            commands.spawn((
-                AudioPlayer(sound),
-                PlaybackSettings {
-                    mode: bevy::audio::PlaybackMode::Despawn,
-                    volume: bevy::audio::Volume::new(volume),
-                    speed: pitch_speed,
-                    spatial: false, // TEST: Changed from true to diagnose spatial audio distance attenuation
-                    ..default()
-                },
-                Transform::from_translation(gun_position_world),
-                GlobalTransform::default(), // FIXED: Required for spatial audio calculations
-            ));
+            // Attach audio to missile with MANUAL attenuation (fixes stereo file issues)
+            commands.entity(missile_entity).with_children(|parent| {
+                parent.spawn((
+                    AudioPlayer(sound),
+                    PlaybackSettings {
+                        mode: bevy::audio::PlaybackMode::Despawn,
+                        volume: bevy::audio::Volume::new(volume),
+                        speed: pitch_speed,
+                        spatial: false, // DISABLED: Handled manually
+                        ..default()
+                    },
+                    ManualAttenuation {
+                        max_distance: 10000.0, // 10km audible range
+                        reference_distance: 400.0, // 400m for long cinematic fade tail
+                        base_volume: volume,
+                        age: 0.0, // Start age at 0
+                        doppler_ramp_time: 0.5, // 0.5s ramp to full Doppler (keeps initial punch)
+                    },
+                    Transform::IDENTITY, // REQUIRED: Allow position inheritance
+                    Visibility::default(),
+                ));
+            });
 
             last_shot.time = current_time;
         }
@@ -2717,7 +3031,22 @@ fn handle_machine_gun_input(
             let forward = -player_transform.local_z();
 
             // Bullets inherit player velocity + muzzle velocity
-            let bullet_velocity = player_velocity.0 + (forward * MG_SPEED);
+            // Tracers are 0.75X speed for visual clarity (they appear slower than regular bullets)
+            let speed_mult = if is_tracer { 0.75 } else { 1.0 };
+            let bullet_velocity = player_velocity.0 + (forward * MG_SPEED * speed_mult);
+
+            // SAFETY: Validate calculated values before spawning
+            if !bullet_position_world.is_finite() {
+                eprintln!("❌ MG SPAWN ABORTED: Invalid position (player transform may be corrupt)");
+                eprintln!("   player_pos={:?}, offset={:?}", player_transform.translation, offset);
+                return; // Skip this shot
+            }
+
+            if !forward.is_finite() || !bullet_velocity.is_finite() {
+                eprintln!("❌ MG SPAWN ABORTED: Invalid velocity calculation");
+                eprintln!("   forward={:?}, bullet_vel={:?}", forward, bullet_velocity);
+                return; // Skip this shot
+            }
 
             // DEBUG: Print spawn info for ALL bullets
             eprintln!("   SPAWN: pos={:.1?}, player_pos={:.1?}, offset={:?}",
@@ -2725,11 +3054,12 @@ fn handle_machine_gun_input(
 
             // Spawn the tracer bullet with slight randomization
             let mut rng = rand::thread_rng();
-            // Randomized length for "streaking" effect (tracers are longer)
+            // Randomized length for "streaking" effect (tracers are longer but not massive)
+            // FIX A: Reduced ranges to prevent capsules from extending far above spawn point
             let length_mult = if is_tracer {
-                rng.gen_range(2.5..4.0)
+                rng.gen_range(1.2..1.8)  // Was 2.5..4.0 (7.5-12m total) → now 3.6-5.4m total
             } else {
-                rng.gen_range(1.5..3.0)
+                rng.gen_range(0.8..1.2)  // Was 1.5..3.0 (4.5-9m total) → now 2.4-3.6m total
             };
             
             // Randomized brightness for "pulsing" effect (tracers are brighter)
@@ -2939,20 +3269,24 @@ fn spawn_bullet(
     glow_mult: f32,
     is_tracer: bool,
 ) {
-    // PHYSICAL THICKNESS BOOST: 0.05 -> 0.12 for regular, 0.08 -> 0.20 for tracer
+    // PHYSICAL THICKNESS BOOST: 0.05 -> 0.12 for regular, 0.08 -> 0.18 for tracer
     // At high flight speeds, we need physical width to avoid pixel-thin lines
-    let radius = if is_tracer { 0.25 } else { 0.12 };
+    // FIX C: Reduced tracer radius 0.25→0.18 (bloom glow provides visual size)
+    let radius = if is_tracer { 0.18 } else { 0.12 };
     let capsule_half_length = 1.5 * length_mult;
     let mesh = meshes.add(Capsule3d::new(radius, capsule_half_length));
     
     let (base_color, emissive) = if is_tracer {
         eprintln!("🔴 CREATING RED TRACER MATERIAL");
-        // Red Super Tracer: INTENSE BLOOM (Bevy example uses up to 1000.0 for intense glow)
-        (Color::srgb(1.0, 0.0, 0.0), LinearRgba::rgb(500.0, 0.0, 0.0))
+        // FIX F: Reduced emissive for new bloom settings (500→40)
+        // With intensity: 0.3 bloom, this creates visible soft red glow (~1-2m halo)
+        // Added green/blue tint (2.0, 2.0) for warmer glow
+        (Color::srgb(1.0, 0.0, 0.0), LinearRgba::rgb(40.0, 2.0, 2.0))
     } else {
         eprintln!("🟡 Creating yellow bullet material");
-        // Standard Yellow Round: Moderate glow
-        (Color::srgb(1.0, 1.0, 0.0), LinearRgba::rgb(200.0, 150.0, 0.0))
+        // FIX F: Reduced emissive for new bloom settings (200/150→15/12)
+        // Subtle warm yellow glow, doesn't compete with tracers
+        (Color::srgb(1.0, 1.0, 0.0), LinearRgba::rgb(15.0, 12.0, 0.0))
     };
 
     eprintln!("   Material: base_color={:?}, emissive={:?}", base_color, emissive);
@@ -2964,30 +3298,59 @@ fn spawn_bullet(
         ..default()
     });
 
-    // CCD: Use velocity to determine rotation so tracers point where they fly
+    // Capsule3d is Y-axis aligned by default — rotate Y axis to point along velocity
+    // (Previous "fix" used Vec3::NEG_Z which made bullets fly sideways — now corrected)
     let rotation = if velocity.length_squared() > 0.001 {
         let vel_normalized = velocity.normalize();
-        let rot = Quat::from_rotation_arc(Vec3::Y, vel_normalized);
-
-        // DEBUG: Print rotation for tracers
-        if is_tracer {
-            eprintln!("🔴 TRACER ROTATION: vel_norm={:.2?}, rot_euler={:.1?}",
-                vel_normalized, rot.to_euler(bevy::math::EulerRot::XYZ));
+        let dot = vel_normalized.dot(Vec3::Y).abs();
+        if dot > 0.999 {
+            Quat::IDENTITY // Near-vertical velocity — avoid degenerate arc (returns NaN)
+        } else {
+            let rot = Quat::from_rotation_arc(Vec3::Y, vel_normalized);
+            if rot.is_finite() && rot.is_normalized() { rot } else { Quat::IDENTITY }
         }
-
-        rot
     } else {
         Quat::IDENTITY
     };
 
     // FIX: Offset spawn position forward by half the capsule length
     // Use plane's forward direction (not velocity) to prevent upward offset when climbing
-    let plane_forward = orientation * Vec3::NEG_Z; // Plane's forward direction
-    let forward_offset = plane_forward * capsule_half_length;
-    let adjusted_position = position + forward_offset;
 
-    eprintln!("   OFFSET: plane_fwd={:.2?}, offset_dist={:.1}, final_pos={:.1?}",
-        plane_forward, capsule_half_length, adjusted_position);
+    // CRITICAL: Validate orientation quaternion before using it
+    if !orientation.is_finite() || !orientation.is_normalized() {
+        eprintln!("❌ SPAWN ERROR: Invalid orientation quaternion!");
+        eprintln!("   orientation={:?}", orientation);
+        return; // Abort spawn - corrupt plane transform
+    }
+
+    // FIX: Spawn bullets directly at gun position without additional forward offset
+    // The wingtip offsets (MG_OFFSET_LEFT/RIGHT) already position bullets correctly
+    // Adding plane_forward offset causes upward displacement when pitching up
+    //
+    // Previous bug: plane_forward * 1.5 added +1.48m Y when pitched 80° up,
+    // making tracers appear at top of screen due to their high emissive/bloom
+    //
+    // FIX B: Spawn bullets directly at gun position - no offset needed
+    // The wingtip offsets (MG_OFFSET_LEFT/RIGHT) already position correctly
+    // With capsule length fixed (Fix A), this offset is unnecessary and causes
+    // issues when pitched due to world-space Y being wrong when oriented
+    let adjusted_position = position;
+
+    eprintln!("   SPAWN: pos={:.1?}, is_tracer={}", adjusted_position, is_tracer);
+
+    // CRITICAL: Validate position before spawning to prevent NaN bullets
+    if !adjusted_position.is_finite() {
+        eprintln!("❌ BULLET SPAWN ERROR: Invalid position detected!");
+        eprintln!("   position={:?}, is_tracer={}", position, is_tracer);
+        return; // Abort spawn - do not create invalid bullet
+    }
+
+    // Additional validation: Check velocity is valid
+    if !velocity.is_finite() || velocity.length_squared() < 0.1 {
+        eprintln!("❌ BULLET SPAWN ERROR: Invalid velocity detected!");
+        eprintln!("   velocity={:?}, length={:?}", velocity, velocity.length());
+        return; // Abort spawn
+    }
 
     commands.spawn((
         Bullet {
@@ -3292,7 +3655,7 @@ fn spawn_missile(
     position: Vec3,
     orientation: Quat,
     velocity: Vec3,
-) {
+) -> Entity {
     // Create missile body (elongated cylinder pointing along -Z)
     let body_mesh = meshes.add(Cylinder::new(MISSILE_BODY_RADIUS, MISSILE_LENGTH));
     let body_material = materials.add(StandardMaterial {
@@ -3386,7 +3749,8 @@ fn spawn_missile(
                 InheritedVisibility::default(),
             ));
         }
-    });
+    })
+    .id()
 }
 /// Component for explosion effects that despawn after a time
 #[derive(Component)]
@@ -3409,7 +3773,6 @@ fn check_ground_collision(
     mut materials: ResMut<Assets<StandardMaterial>>,
     sounds: Res<GameAssets>,
 ) {
-    const GROUND_LEVEL: f32 = 0.0;
     const SOFT_CEILING: f32 = 0.5; // Don't let physics see us below this (avoids AABB edge cases)
 
     for (_entity, mut transform, mut velocity, mut ang_vel) in &mut player_query {
@@ -3432,7 +3795,13 @@ fn check_ground_collision(
              continue;
         }
 
-        if transform.translation.y <= GROUND_LEVEL {
+        // Calculate dynamic terrain height at player position
+        let terrain_height = get_terrain_height(transform.translation.x, transform.translation.z);
+        // Collision threshold is terrain height + safety margin (need clearance above ground)
+        const CRASH_MARGIN: f32 = 5.0; // Reduced from 50.0 to fix mid-air collisions
+        let ground_level = terrain_height + CRASH_MARGIN;
+
+        if transform.translation.y <= ground_level {
             let crash_speed = velocity.length();
 
             if crash_speed > 50.0 {
@@ -3456,12 +3825,27 @@ fn check_ground_collision(
                 *ang_vel = AngularVelocity::default();
             } else {
                 // Soft landing: keep above ground and zero downward velocity
-                transform.translation.y = GROUND_LEVEL + SOFT_CEILING;
+                transform.translation.y = ground_level + SOFT_CEILING;
                 velocity.0.y = velocity.0.y.max(0.0);
+
+                // FIX: Reset rotation if plane is severely tilted (prevents stuck on side)
+                // Check roll angle - if more than 45° tilted, reset to upright
+                let (pitch, yaw, roll) = transform.rotation.to_euler(bevy::math::EulerRot::XYZ);
+                if roll.abs() > 0.785 || pitch.abs() > 1.57 {  // 45° roll or 90° pitch
+                    eprintln!("⚠️ SOFT LANDING: Resetting rotation (roll={:.1}°, pitch={:.1}°)",
+                        roll.to_degrees(), pitch.to_degrees());
+
+                    // Reset to level flight orientation
+                    transform.rotation = Quat::IDENTITY;
+
+                    // Give small forward velocity to help unstick
+                    *velocity = LinearVelocity(Vec3::new(0.0, 0.0, -50.0));
+                    *ang_vel = AngularVelocity::ZERO;
+                }
             }
-        } else if transform.translation.y < GROUND_LEVEL + SOFT_CEILING {
+        } else if transform.translation.y < ground_level + SOFT_CEILING {
             // Clamp just above ground so we never penetrate (helps collision/physics stability)
-            transform.translation.y = GROUND_LEVEL + SOFT_CEILING;
+            transform.translation.y = ground_level + SOFT_CEILING;
         }
     }
 }
