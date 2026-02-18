@@ -48,4 +48,13 @@ pub struct GameAssets {
 
     #[asset(path = "sounds/machine_gun.ogg")]
     pub machine_gun: Handle<AudioSource>,
+
+    #[asset(path = "sounds/cinematic/air_rip.ogg")]
+    pub air_rip: Handle<AudioSource>,
+
+    #[asset(path = "sounds/cinematic/lock_on.ogg")]
+    pub lock_on: Handle<AudioSource>,
+
+    #[asset(path = "sounds/cinematic/afterburner_thump.ogg")]
+    pub afterburner_thump: Handle<AudioSource>,
 }

@@ -5,12 +5,13 @@ edition = "2021"
 
 [dependencies]
 # Removed dynamic_linking due to linker issues on Windows
-bevy = { version = "0.15" }
+bevy = { version = "0.15", features = ["ktx2", "zstd"] }
 avian3d = { version = "0.2", features = ["f32"] }
 rand = "0.8"
 bevy_asset_loader = "0.22"
 winit = "0.30"
 image = "0.25"
+noise = "0.9"
 
 # Development Profile (cargo run)
 [profile.dev]

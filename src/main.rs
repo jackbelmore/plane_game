@@ -2,6 +2,7 @@ use bevy::{
     pbr::{CascadeShadowConfigBuilder, DirectionalLightShadowMap},
     prelude::*,
     render::mesh::VertexAttributeValues,
+    render::camera::Exposure,
     image::{ImageSampler, ImageAddressMode, ImageSamplerDescriptor},
     window::PrimaryWindow,
     winit::WinitWindows,
@@ -12,6 +13,7 @@ use avian3d::prelude::*;
 use rand::prelude::*;
 use std::io::Write;
 use noise::{NoiseFn, Perlin}; // Added for terrain generation
+use bevy::math::VectorSpace; // Added for lerp on colors
 
 mod drone;
 mod ui; // NEW: HUD System
@@ -30,27 +32,50 @@ pub enum GameState {
     Paused,
 }
 
-/// Generate terrain height using Perlin noise
+/// Generate terrain height using a multi-biome selector (Plains, Canyons, Mountains)
 fn get_terrain_height(world_x: f32, world_z: f32) -> f32 {
-    let perlin = Perlin::new(42); // Fixed seed for deterministic terrain
+    let perlin = Perlin::new(42);
 
-    // Layer 1: Large rolling hills (500m wavelength, 100m amplitude - doubled for visibility)
-    let scale_large = 0.002; // 1/500
-    let height_large = perlin.get([world_x as f64 * scale_large, world_z as f64 * scale_large]) as f32 * 100.0;
+    // 1. BIOME SELECTOR (Very large scale: 1/4000 meters)
+    // Determines where mountains, flats, and canyons are placed
+    let selector_raw = perlin.get([world_x as f64 * 0.0002, world_z as f64 * 0.0002]) as f32;
+    let s = (selector_raw + 1.0) / 2.0; // Map -1..1 to 0..1
 
-    // Layer 2: Medium features (100m wavelength, 15m amplitude)
-    let scale_medium = 0.01; // 1/100
-    let height_medium = perlin.get([world_x as f64 * scale_medium + 100.0, world_z as f64 * scale_medium + 100.0]) as f32 * 15.0;
+    // 2. BIOME A: FLATLANDS (Lowlands)
+    // Gently rolling plains for high-speed flight
+    let flat_noise = perlin.get([world_x as f64 * 0.001, world_z as f64 * 0.001]) as f32;
+    let biome_flats = flat_noise * 30.0;
 
-    // Layer 3: Small details (20m wavelength, 3m amplitude)
-    let scale_small = 0.05; // 1/20
-    let height_small = perlin.get([world_x as f64 * scale_small + 200.0, world_z as f64 * scale_small + 200.0]) as f32 * 3.0;
+    // 3. BIOME B: THE CANYONS (Ridged Noise)
+    // Sharp valleys and narrow passes for tactical maneuvering
+    let ridge_raw = perlin.get([world_x as f64 * 0.002, world_z as f64 * 0.002]) as f32;
+    let biome_canyons = (1.0 - ridge_raw.abs()).powi(2) * 500.0 - 250.0;
 
-    // Combine layers (additive for natural-looking terrain)
-    let total_height = height_large + height_medium + height_small;
+    // 4. BIOME C: MASSIVE PEAKS (Highlands)
+    // Huge 1.2km+ mountains that force the player to climb or dodge
+    let mountain_raw = perlin.get([world_x as f64 * 0.0007, world_z as f64 * 0.0007]) as f32;
+    let mountain_base = (mountain_raw.abs() * 1400.0) - 100.0;
+    // Add craggy detail to the mountain peaks
+    let mountain_detail = perlin.get([world_x as f64 * 0.005, world_z as f64 * 0.005]) as f32 * 50.0;
+    let biome_mountains = mountain_base + mountain_detail;
 
-    // Clamp to reasonable range (prevent crazy mountains)
-    total_height.clamp(-50.0, 150.0) // Increased range for more dramatic terrain
+    // 5. WEIGHTED BIOME BLENDING
+    // Blends smoothly between types to avoid hard "cliffs" at biome borders
+    if s < 0.35 {
+        // Mostly flats, blending into canyons
+        let t = (s / 0.35).clamp(0.0, 1.0);
+        // Smoothstep interpolation for natural transitions
+        let smooth_t = t * t * (3.0 - 2.0 * t);
+        biome_flats + (biome_canyons - biome_flats) * smooth_t
+    } else if s < 0.65 {
+        // Canyons blending into mountains
+        let t = ((s - 0.35) / 0.3).clamp(0.0, 1.0);
+        let smooth_t = t * t * (3.0 - 2.0 * t);
+        biome_canyons + (biome_mountains - biome_canyons) * smooth_t
+    } else {
+        // Pure high-altitude mountain range
+        biome_mountains
+    }
 }
 
 // #region agent log
@@ -77,24 +102,39 @@ struct AfterburnerParticles {
     spawn_rate: f32,
     spawn_threshold: f32,
     particle_lifetime: f32,
+    last_spawn_pos: Option<Vec3>, // For "Ribbon" interpolation
 }
 
 impl Default for AfterburnerParticles {
     fn default() -> Self {
         Self {
-            spawn_rate: 5.0,
-            spawn_threshold: 0.2,
-            particle_lifetime: 0.8,
+            spawn_rate: 60.0, // Increased spawn rate for dense ribbons
+            spawn_threshold: 0.1,
+            particle_lifetime: 1.5, // Longer life for lingering trails
+            last_spawn_pos: None,
         }
     }
 }
 
-/// Individual particle component
+#[derive(Clone, Copy, PartialEq)]
+enum ParticleType {
+    Exhaust, // Fire transitioning to smoke
+    BulletImpact,
+    Explosion,
+}
+
+/// Individual particle component for cinematic trails
 #[derive(Component)]
 struct Particle {
     lifetime_remaining: f32,
     lifetime_max: f32,
     velocity: Vec3,
+    start_scale: f32,
+    end_scale: f32,
+    start_color: LinearRgba,
+    end_color: LinearRgba,
+    base_emissive: LinearRgba,
+    p_type: ParticleType,
 }
 
 /// Chunk coordinate system
@@ -185,6 +225,10 @@ struct SkySphere;
 /// Marker component for the infinite horizon disk
 #[derive(Component)]
 struct HorizonDisk;
+
+/// Marker component for the visual sun sphere
+#[derive(Component)]
+struct SunMarker;
 
 /// Resource holding the shared ground material (loaded once at startup)
 #[derive(Resource)]
@@ -723,6 +767,7 @@ fn main() {
             update_particles, // Update particle positions and fade
             update_cloud_billboards, // NEW: Make clouds face camera
             update_sky_sphere, // NEW: Keep sky sphere centered on camera
+            update_sun_position, // NEW: Keep sun disc at fixed sky angle relative to camera
             update_horizon_disk, // NEW: Keep horizon disk centered on camera (XZ)
             update_flight_camera,
             debug_flight_data,
@@ -803,8 +848,10 @@ fn setup_scene(
 
     commands.spawn((
         DirectionalLight {
-            illuminance: 30000.0,
+            illuminance: 100_000.0, // Physical direct sunlight (matches Exposure::SUNLIGHT EV100=15)
             shadows_enabled: true,
+            shadow_depth_bias: 0.02,  // Low bias fine — ground is unlit:true, only trees/buildings cast
+            shadow_normal_bias: 1.8,  // Default — avoids Peter-Pan on buildings
             ..default()
         },
         // Tuned shadow config for Flight Sim scale (large distances)
@@ -820,10 +867,11 @@ fn setup_scene(
         GlobalTransform::default(),
     ));
 
-    // Restore AmbientLight (so scene isn't black)
+    // Sky fill light — physical scale to match DirectionalLight 100,000 lux + Exposure::SUNLIGHT
+    // 2500 lux = ~2.5% of direct sunlight, realistic open-sky ambient (trees/buildings not black in shadow)
     commands.insert_resource(AmbientLight {
-        color: Color::WHITE,
-        brightness: 80.0, // HDR-safe: 200.0 caused black screen with bloom (over-exposure)
+        color: Color::srgb(0.8, 0.85, 1.0), // Slight blue tint — sky bounce
+        brightness: 2500.0,
     });
 
     // === CREATE SHARED GROUND MATERIAL WITH ASSET LOADER TEXTURE ===
@@ -862,6 +910,29 @@ fn setup_scene(
         Transform::from_scale(Vec3::new(1.0, 1.0, -1.0)), // Invert sphere to show texture inside
         GlobalTransform::default(),
     ));
+
+    // --- Visual Sun Disc (emissive sphere, follows camera like sky sphere) ---
+    // Direction must match the DirectionalLight transform above: XYZ(-0.5, 0.5, 0.0)
+    {
+        let sun_rotation = Quat::from_euler(EulerRot::XYZ, -0.5, 0.5, 0.0);
+        let sun_dir = sun_rotation.mul_vec3(Vec3::Z).normalize();
+        let sun_distance = 18000.0_f32; // Inside sky sphere (20km radius)
+        let sun_radius = 1500.0_f32;    // ~9.5° apparent diameter — large dramatic disc
+
+        commands.spawn((
+            SunMarker,
+            Mesh3d(meshes.add(Sphere::new(sun_radius))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(1.0, 0.95, 0.7),
+                emissive: LinearRgba::rgb(5000.0, 4000.0, 1500.0), // Far above bloom threshold
+                unlit: true,
+                fog_enabled: false,
+                ..default()
+            })),
+            Transform::from_translation(sun_dir * sun_distance),
+            GlobalTransform::default(),
+        ));
+    }
 
     // GLOBAL GROUND REMOVED - Replaced by Chunk System
 
@@ -919,10 +990,19 @@ fn setup_scene(
         Camera { hdr: true, ..default() }, // REQUIRED: Bloom needs HDR or all values are clamped to 1.0
         Msaa::Off, // HDR + MSAA causes black screen/artifacts in Bevy 0.15 - must disable
         // ReinhardLuminance does NOT require tonemapping_luts feature (safe fallback)
-        // TonyMcMapface requires tonemapping_luts cargo feature - using Reinhard to isolate black screen
         bevy::core_pipeline::tonemapping::Tonemapping::ReinhardLuminance,
         // Bloom::NATURAL preset - proven working in official Bevy 0.15 bloom_3d example
         bevy::core_pipeline::bloom::Bloom::NATURAL,
+        // Physical camera exposure calibrated for outdoor sunlight (matches DirectionalLight 100,000 lux)
+        Exposure { ev100: 15.0 }, // Exposure::SUNLIGHT — prevents overexposure of bright scene
+        // IBL environment map: provides specular reflections on metallic surfaces (e.g. F-16 fuselage)
+        // Required for metals to look shiny — without this they appear flat/black from most angles
+        EnvironmentMapLight {
+            diffuse_map: asset_server.load("environment_maps/pisa_diffuse_rgb9e5_zstd.ktx2"),
+            specular_map: asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
+            intensity: 900.0, // Sky ambient fill — Bevy standard outdoor value (pbr.rs example)
+            ..default()
+        },
         SpatialListener::default(), // FIXED: Enable spatial audio by attaching listener to camera
         Projection::Perspective(PerspectiveProjection {
             far: 100000.0,  // Increased further to cover massive distances
@@ -1136,8 +1216,7 @@ fn create_terrain_mesh(
     meshes: &mut Assets<Mesh>,
 ) -> Handle<Mesh> {
     const SUBDIVISIONS: usize = 20; // 20x20 grid = 400 triangles per chunk
-    // CHUNK_SIZE is already defined globally
-
+    
     let chunk_world_x = chunk_coord.x as f32 * CHUNK_SIZE;
     let chunk_world_z = chunk_coord.z as f32 * CHUNK_SIZE;
 
@@ -1146,7 +1225,7 @@ fn create_terrain_mesh(
     let mut uvs = Vec::new();
     let mut indices = Vec::new();
 
-    // Generate vertices with heightmap
+    // 1. Generate vertices with heightmap
     for z in 0..=SUBDIVISIONS {
         for x in 0..=SUBDIVISIONS {
             let local_x = (x as f32 / SUBDIVISIONS as f32) * CHUNK_SIZE - CHUNK_SIZE / 2.0;
@@ -1156,11 +1235,21 @@ fn create_terrain_mesh(
             let world_z = chunk_world_z + local_z;
 
             let height = get_terrain_height(world_x, world_z);
-
             positions.push([local_x, height, local_z]);
-            normals.push([0.0, 1.0, 0.0]); // Simple normal (could calculate from neighbors for lighting)
             
-            // UV tiling: Multiply by 10.0 to match the previous Plane3d tiling
+            // 2. CALCULATE SURFACE NORMAL
+            // Sample neighbor heights to determine the slope (essential for shading mountains)
+            const EPS: f32 = 1.0; // 1 meter sampling distance
+            let h_r = get_terrain_height(world_x + EPS, world_z);
+            let h_l = get_terrain_height(world_x - EPS, world_z);
+            let h_d = get_terrain_height(world_x, world_z + EPS);
+            let h_u = get_terrain_height(world_x, world_z - EPS);
+            
+            // Normal = cross product of the two tangent vectors (u and v)
+            let normal = Vec3::new(h_l - h_r, 2.0 * EPS, h_u - h_d).normalize();
+            normals.push([normal.x, normal.y, normal.z]);
+            
+            // UV tiling: Multiply by 10.0 for seamless grass
             let u = (x as f32 / SUBDIVISIONS as f32) * 10.0;
             let v = (z as f32 / SUBDIVISIONS as f32) * 10.0;
             uvs.push([u, v]);
@@ -1782,6 +1871,19 @@ fn update_sky_sphere(
     }
 }
 
+/// Keep the visual sun disc at a fixed direction from the camera (matches DirectionalLight rotation)
+fn update_sun_position(
+    mut sun_query: Query<&mut Transform, With<SunMarker>>,
+    camera_query: Query<&Transform, (With<Camera3d>, Without<SunMarker>)>,
+) {
+    let Ok(cam) = camera_query.get_single() else { return };
+    let sun_rotation = Quat::from_euler(EulerRot::XYZ, -0.5, 0.5, 0.0);
+    let sun_dir = sun_rotation.mul_vec3(Vec3::Z).normalize();
+    for mut sun_transform in &mut sun_query {
+        sun_transform.translation = cam.translation + sun_dir * 18000.0;
+    }
+}
+
 /// Keep the horizon disk centered on the camera (XZ only)
 fn update_horizon_disk(
     mut horizon_query: Query<&mut Transform, With<HorizonDisk>>,
@@ -1825,9 +1927,10 @@ fn spawn_meteors_in_chunk(
     commands.entity(chunk_entity).with_children(|parent| {
         for _ in 0..METEOR_COUNT {
             // Local position within the 1km chunk
+            // Adjusted altitude range: 1500m to 6000m (Avoids new 1.4km mountains)
             let pos = Vec3::new(
                 rng.gen_range(-CHUNK_SIZE/2.0..CHUNK_SIZE/2.0),
-                rng.gen_range(200.0..4000.0), // Scattered from 200m to 4km altitude
+                rng.gen_range(1500.0..6000.0), 
                 rng.gen_range(-CHUNK_SIZE/2.0..CHUNK_SIZE/2.0),
             );
 
@@ -1839,13 +1942,22 @@ fn spawn_meteors_in_chunk(
                 rng.gen_range(0.0..std::f32::consts::TAU),
             );
             
-            // Size: Mostly small (scale 2-8), rare large ones (up to 20)
+            // Size Variation: "Grand Canyon" Scale
             let scale_roll = rng.gen_range(0.0..1.0);
-            let scale = if scale_roll > 0.9 {
-                rng.gen_range(12.0..25.0) // Big ones
+            let scale = if scale_roll > 0.98 {
+                // TITAN CLASS (2%): Massive floating islands
+                rng.gen_range(60.0..120.0) 
+            } else if scale_roll > 0.85 {
+                // HEAVY CLASS (13%): Major obstacles
+                rng.gen_range(15.0..40.0)
             } else {
-                rng.gen_range(2.0..8.0) // Small litter
+                // STANDARD/DEBRIS (85%): Visual clutter
+                rng.gen_range(1.0..8.0)
             };
+
+            // Mass calculation (approximate density)
+            // Scale^3 volume approximation
+            let mass = (scale as f32).powi(3) * 10.0;
 
             let model_handle = meteor_models[rng.gen_range(0..meteor_models.len())].clone();
 
@@ -1861,8 +1973,13 @@ fn spawn_meteors_in_chunk(
                 GlobalTransform::default(),
                 Visibility::default(),
                 InheritedVisibility::default(),
-                RigidBody::Static,
-                Collider::sphere(0.8), 
+                // PHYSICS RESTORED: Dynamic Floating Objects
+                RigidBody::Dynamic,
+                Collider::sphere(0.8), // Collider scales with Transform
+                Mass(mass),
+                GravityScale(0.0), // Zero Gravity (Floating)
+                LinearDamping(0.5), // Air resistance / Space drag
+                AngularDamping(0.5), // Rotational drag
             ));
         }
     });
@@ -1883,11 +2000,15 @@ fn spawn_objectives(
     ];
 
     for (i, pos) in positions.iter().enumerate() {
+        // Sample height so they don't spawn underground
+        let terrain_y = get_terrain_height(pos.x, pos.z);
+        let spawn_pos = Vec3::new(pos.x, terrain_y, pos.z);
+
         commands.spawn((
             Objective,
             SceneRoot(dish_handle.clone()),
             Transform {
-                translation: *pos,
+                translation: spawn_pos,
                 rotation: Quat::from_rotation_y(i as f32 * 2.0),
                 scale: Vec3::splat(15.0), // Scale up to be a good target
             },
@@ -1917,13 +2038,16 @@ fn spawn_turrets(
     ];
 
     for pos in positions {
+        let terrain_y = get_terrain_height(pos.x, pos.z);
+        let spawn_pos = Vec3::new(pos.x, terrain_y, pos.z);
+
         commands.spawn((
             Turret {
                 fire_timer: Timer::from_seconds(2.0, TimerMode::Repeating),
             },
             SceneRoot(turret_handle.clone()),
             Transform {
-                translation: pos,
+                translation: spawn_pos,
                 rotation: Quat::IDENTITY,
                 scale: Vec3::splat(15.0),
             },
@@ -2133,19 +2257,19 @@ fn read_player_input(
         let target_pitch = if keyboard_input.pressed(KeyCode::KeyW) { -1.0 }
                           else if keyboard_input.pressed(KeyCode::KeyS) { 1.0 }
                           else { 0.0 };
-        input.pitch = input.pitch.lerp(target_pitch, 0.1);
+        input.pitch = VectorSpace::lerp(input.pitch, target_pitch, 0.1);
 
         // Roll (A/D) - Direct control
         let target_roll = if keyboard_input.pressed(KeyCode::KeyA) { -1.0 }
                          else if keyboard_input.pressed(KeyCode::KeyD) { 1.0 }
                          else { 0.0 };
-        input.roll = input.roll.lerp(target_roll, 0.1);
+        input.roll = VectorSpace::lerp(input.roll, target_roll, 0.1);
 
         // Yaw (Q/E) - Direct control
         let target_yaw = if keyboard_input.pressed(KeyCode::KeyQ) { 1.0 } 
                         else if keyboard_input.pressed(KeyCode::KeyE) { -1.0 } 
                         else { 0.0 };
-        input.yaw = input.yaw.lerp(target_yaw, 0.1);
+        input.yaw = VectorSpace::lerp(input.yaw, target_yaw, 0.1);
 
         // Throttle (Shift/Ctrl)
         if keyboard_input.pressed(KeyCode::ShiftLeft) {
@@ -3935,7 +4059,6 @@ fn update_explosion_effects(
     }
 }
 
-/// Spawn particle effects from jet exhaust based on throttle
 fn spawn_afterburner_particles(
     mut commands: Commands,
     time: Res<Time>,
@@ -3943,111 +4066,107 @@ fn spawn_afterburner_particles(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     player_query: Query<(&Transform, &PlayerInput, &LinearVelocity), With<PlayerPlane>>,
-    emitter_query: Query<&AfterburnerParticles, With<PlayerPlane>>,
+    mut emitter_query: Query<&mut AfterburnerParticles, With<PlayerPlane>>,
 ) {
-    // #region agent log
-    let (player_ok, emitter_ok) = (player_query.get_single(), emitter_query.get_single());
-    if player_ok.is_err() || emitter_ok.is_err() {
-        debug_log("spawn_afterburner_particles", "query get_single failed", &format!(r#"{{"player_ok":{},"emitter_ok":{}}}"#, player_ok.is_ok(), emitter_ok.is_ok()), "D");
-        return;
-    }
-    let (player_transform, input, player_velocity) = player_ok.unwrap();
-    let emitter = emitter_ok.unwrap();
-    // #endregion
-
-    // NaN SAFETY: Don't spawn particles if throttle is corrupted
-    if input.throttle.is_nan() {
-        return;
-    }
+    let Ok((player_transform, input, player_velocity)) = player_query.get_single() else { return };
+    let Ok(mut emitter) = emitter_query.get_single_mut() else { return };
 
     if input.throttle < emitter.spawn_threshold {
-        // #region agent log
-        debug_log("spawn_afterburner_particles", "throttle below threshold", &format!(r#"{{"throttle":{},"spawn_threshold":{}}}"#, input.throttle, emitter.spawn_threshold), "A");
-        // #endregion
+        emitter.last_spawn_pos = None;
         return;
     }
 
-    let throttle_factor = (input.throttle - emitter.spawn_threshold) / (1.0 - emitter.spawn_threshold);
-    let actual_spawn_rate = emitter.spawn_rate * throttle_factor;
-    let spawn_count = actual_spawn_rate as u32;
-    // #region agent log
-    debug_log("spawn_afterburner_particles", "spawn rate computed", &format!(r#"{{"throttle":{},"throttle_factor":{},"actual_spawn_rate":{},"spawn_count_u32":{}}}"#, input.throttle, throttle_factor, actual_spawn_rate, spawn_count), "A");
-    // #endregion
-
-    // Exhaust always behind plane in world space (avoids flame appearing at wing when banked)
+    // 1. CALCULATE EXHAUST NOZZLE POSITION
     let back = (-player_transform.forward().as_vec3()).normalize_or_zero();
-    const EXHAUST_DISTANCE: f32 = 2.8; // Further back so flame is outside exhaust, not inside fuselage
-    const EXHAUST_SHIFT_LEFT: f32 = 2.6; // Nudge left so flame is at center exhaust
-    let world_pos: Vec3 = player_transform.translation
+    const EXHAUST_DISTANCE: f32 = 2.8;
+    const EXHAUST_SHIFT_LEFT: f32 = 2.6;
+    let current_spawn_pos = player_transform.translation
         + back * EXHAUST_DISTANCE
         - player_transform.right().as_vec3() * EXHAUST_SHIFT_LEFT;
+
+    // 2. RIBBON INTERPOLATION (Fill the gap between frames)
+    let last_pos = emitter.last_spawn_pos.unwrap_or(current_spawn_pos);
+    let distance = last_pos.distance(current_spawn_pos);
     
-    // #region agent log
-    if spawn_count > 0 {
-        debug_log("spawn_afterburner_particles", "spawn world_pos", &format!(r#"{{"world_pos":[{},{},{}],"player_translation":[{},{},{}],"back":[{},{},{}]}}"#, world_pos.x, world_pos.y, world_pos.z, player_transform.translation.x, player_transform.translation.y, player_transform.translation.z, back.x, back.y, back.z), "B");
-    }
-    // #endregion
+    let throttle_factor = (input.throttle - emitter.spawn_threshold) / (1.0 - emitter.spawn_threshold);
+    let base_count = (emitter.spawn_rate * time.delta_secs() * throttle_factor) as usize;
+    let distance_count = (distance / 0.5) as usize;
+    let total_to_spawn = (base_count + distance_count).clamp(1, 50);
 
-    for _ in 0..spawn_count {
+    let smoke_handle = asset_server.load("textures/clouds/FX_CloudAlpha01.png"); 
+    
+    for i in 0..total_to_spawn {
+        let t = i as f32 / total_to_spawn as f32;
+        let spawn_pos = last_pos.lerp(current_spawn_pos, t);
 
-            let backward_velocity = player_transform.forward().as_vec3() * -20.0;
-            // Inherit 20% of player velocity for "drag" effect (smoke trail)
-            // If player is moving fast forward, particles shouldn't stop instantly
-            let inherited_velocity = player_velocity.0 * 0.2;
+        let inherited_velocity = player_velocity.0 * 0.4;
+        let engine_blast = back * (20.0 + throttle_factor * 40.0);
+        let jitter = Vec3::new(
+            (rand::random::<f32>() - 0.5) * 4.0,
+            (rand::random::<f32>() - 0.5) * 4.0,
+            (rand::random::<f32>() - 0.5) * 4.0,
+        );
+        let velocity = inherited_velocity + engine_blast + jitter;
 
-            let random_spread = Vec3::new(
-                (rand::random::<f32>() - 0.5) * 5.0,
-                (rand::random::<f32>() - 0.5) * 5.0,
-                (rand::random::<f32>() - 0.5) * 5.0,
-            );
-            let velocity = backward_velocity + inherited_velocity + random_spread;
+        let is_afterburner = input.throttle > 0.9;
+        
+        let (start_color, end_color, start_scale, end_scale, emissive) = if is_afterburner {
+            (
+                LinearRgba::rgb(0.2, 0.8, 1.0),
+                LinearRgba::rgb(0.3, 0.3, 0.35),
+                1.5,
+                8.0,
+                LinearRgba::rgb(10.0, 40.0, 100.0)
+            )
+        } else {
+            (
+                LinearRgba::rgb(0.8, 0.4, 0.1),
+                LinearRgba::rgb(0.2, 0.2, 0.2),
+                0.8,
+                5.0,
+                LinearRgba::rgb(4.0, 1.0, 0.0)
+            )
+        };
 
-            let flame_index = ((time.elapsed_secs() * 15.0) as usize) % 6 + 1;
-            let texture_path = format!("particles/flame_0{}.png", flame_index);
-            let texture_handle = asset_server.load(&texture_path);
+        let material = materials.add(StandardMaterial {
+            base_color_texture: Some(smoke_handle.clone()),
+            base_color: Color::from(start_color),
+            emissive: emissive,
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            ..default()
+        });
 
-            let material = StandardMaterial {
-                base_color_texture: Some(texture_handle),
-                base_color: Color::srgba(1.0, 0.35, 0.05, 0.95), // Red-orange flame
-                emissive: LinearRgba::rgb(8.0, 2.5, 0.2),      // Bright orange flame glow
-                alpha_mode: AlphaMode::Blend,
-                unlit: true,
-                double_sided: true, // Visible from both sides
-                cull_mode: None,
+        let mesh = meshes.add(Mesh::from(Rectangle::new(1.0, 1.0)));
+
+        commands.spawn((
+            Particle {
+                lifetime_remaining: emitter.particle_lifetime,
+                lifetime_max: emitter.particle_lifetime,
+                velocity,
+                start_scale,
+                end_scale,
+                start_color,
+                end_color,
+                base_emissive: emissive,
+                p_type: ParticleType::Exhaust,
+            },
+            Transform {
+                translation: spawn_pos,
+                scale: Vec3::splat(start_scale),
                 ..default()
-            };
+            },
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+            MeshMaterial3d(material),
+            Mesh3d(mesh),
+        ));
+    }
 
-            let material_handle = materials.add(material);
-            
-            // Dynamic scaling: Boost makes flame HUGE
-            let size = if input.throttle > 0.8 {
-                2.5 + (input.throttle - 0.8) * 5.0
-            } else {
-                1.2 + input.throttle * 1.5
-            };
-            
-            // Safety Clamp to prevent giant needles
-            let size = size.clamp(0.1, 10.0);
-            
-            let quad_mesh = meshes.add(Mesh::from(Rectangle::new(size, size)));
-
-            commands.spawn((
-                Particle {
-                    lifetime_remaining: emitter.particle_lifetime,
-                    lifetime_max: emitter.particle_lifetime,
-                    velocity,
-                },
-                Transform::from_translation(world_pos),
-                GlobalTransform::default(),
-                Visibility::default(),
-                InheritedVisibility::default(),
-                MeshMaterial3d(material_handle),
-                Mesh3d(quad_mesh),
-            ));
-        }
+    emitter.last_spawn_pos = Some(current_spawn_pos);
 }
 
-/// Update particles: movement, fade, despawn
 fn update_visual_debris(
     mut commands: Commands,
     time: Res<Time>,
@@ -4069,64 +4188,38 @@ fn update_particles(
     mut particle_query: Query<(Entity, &mut Transform, &mut Particle, &mut MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     camera_query: Query<&Transform, (With<Camera3d>, Without<Particle>)>,
-    mut log_acc: Local<f32>,
 ) {
     let camera_transform = camera_query.get_single().ok();
-
-    // #region agent log
-    *log_acc += time.delta_secs();
-    let should_log = *log_acc >= 1.0;
-    if should_log {
-        *log_acc = 0.0;
-    }
-    let mut log_count: u32 = 0;
-    let mut log_first_pos = Vec3::ZERO;
-    let mut log_first_life = -1.0_f32;
-    // #endregion
+    let dt = time.delta_secs();
 
     for (entity, mut transform, mut particle, material_handle) in &mut particle_query {
-        // NaN CHECK
-        if transform.translation.is_nan() {
+        particle.lifetime_remaining -= dt;
+        if particle.lifetime_remaining <= 0.0 || transform.translation.is_nan() {
             commands.entity(entity).despawn();
             continue;
         }
 
-        // #region agent log
-        log_count += 1;
-        if log_count == 1 {
-            log_first_pos = transform.translation;
-            log_first_life = particle.lifetime_remaining;
+        let age_t = (1.0 - (particle.lifetime_remaining / particle.lifetime_max)).clamp(0.0, 1.0);
+        let buoyancy = Vec3::Y * 4.0 * age_t; 
+        transform.translation += (particle.velocity + buoyancy) * dt;
+
+        let current_scale = particle.start_scale + (particle.end_scale - particle.start_scale) * age_t;
+        transform.scale = Vec3::splat(current_scale);
+
+        if let Some(material) = materials.get_mut(&material_handle.0) {
+            let current_color = VectorSpace::lerp(particle.start_color, particle.end_color, age_t);
+            let alpha = if age_t > 0.8 { (1.0 - age_t) / 0.2 } else { 1.0 };
+            material.base_color = Color::from(current_color).with_alpha(alpha);
+            let emissive_fade = (1.0 - (age_t * 2.0)).max(0.0);
+            material.emissive = particle.base_emissive * emissive_fade;
         }
-        // #endregion
-        particle.lifetime_remaining -= time.delta_secs();
 
-        if particle.lifetime_remaining <= 0.0 {
-            commands.entity(entity).despawn();
-            continue;
-        }
-
-        let drift = Vec3::Y * 5.0 * time.delta_secs();
-        transform.translation += particle.velocity * time.delta_secs() + drift;
-
-        // Face the camera (billboarding)
         if let Some(cam_transform) = camera_transform {
             transform.look_at(cam_transform.translation, Vec3::Y);
         }
-
-        let opacity = particle.lifetime_remaining / particle.lifetime_max;
-        if let Some(material) = materials.get_mut(&material_handle.0) {
-            material.base_color.set_alpha(opacity);
-        }
     }
-
-    // #region agent log
-    if should_log {
-        debug_log("update_particles", "particle count and first", &format!(r#"{{"particle_count":{},"first_pos":[{},{},{}],"first_lifetime_remaining":{}}}"#, log_count, log_first_pos.x, log_first_pos.y, log_first_pos.z, log_first_life), "E");
-    }
-    // #endregion
 }
 
-/// Diagnostic system to check if Tree SceneRoot children are being spawned
 fn debug_tree_hierarchy(
     query: Query<(Entity, &Children), With<Tree>>,
 ) {
@@ -4143,12 +4236,10 @@ fn debug_tree_hierarchy(
 
     if total_trees_with_children == 0 {
         eprintln!("⚠️  DEBUG: Sampled 5 trees, NONE have children! Scene loading might be broken.");
-        eprintln!("⚠️  If this persists, try removing #Scene0 from asset paths or checking file format.");
     } else {
         eprintln!("✓ Trees have children - Scene loading works! (avg {} children per tree)", total_children_count / total_trees_with_children.max(1));
     }
 }
-
 fn set_window_icon(
     winit_windows: NonSend<WinitWindows>,
     game_assets: Res<GameAssets>,
